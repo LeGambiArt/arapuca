@@ -314,6 +314,96 @@ fn seatbelt_denies_read_outside_paths() {
     );
 }
 
+/// Seatbelt denies directory listings outside explicitly allowed paths.
+///
+/// Non-root ancestors need metadata access for process startup and path
+/// traversal, but must not expose directory contents when no volumes are
+/// configured. The shell prints a marker and the command status so a launch
+/// failure cannot be mistaken for a successful enforcement check. The root
+/// directory is a documented Seatbelt bootstrap exception because dyld
+/// requires data access.
+#[test]
+fn seatbelt_denies_unmounted_directory_listings() {
+    for directory in [
+        "/opt",
+        "/etc",
+        "/tmp",
+        "/var",
+        "/Users",
+        "/private",
+        "/private/var",
+    ] {
+        let (stdout_r, stdout_w) = pipe_pair();
+        let (stderr_r, stderr_w) = pipe_pair();
+        let mut cfg = base_config("darwin-deny-listing");
+        cfg.stdout = Some(stdout_w.as_raw_fd());
+        cfg.stderr = Some(stderr_w.as_raw_fd());
+
+        let command = format!(
+            "printf 'started\\n'; /bin/ls {directory}/ >/dev/null; printf 'ls-status=%s\\n' $?"
+        );
+        let sb = new().unwrap();
+        let mut proc = sb.launch(&cfg, "/bin/sh", &["-c", &command]).unwrap();
+
+        drop(stdout_w);
+        drop(stderr_w);
+
+        let mut stdout = String::new();
+        stdout_r.take(4096).read_to_string(&mut stdout).unwrap();
+        let mut stderr = String::new();
+        stderr_r.take(4096).read_to_string(&mut stderr).unwrap();
+        let status = proc.wait().unwrap();
+        proc.cleanup();
+
+        assert!(status.success(), "shell should execute for {directory}");
+        assert!(
+            stdout.contains("started\n"),
+            "shell did not start: {stdout}"
+        );
+        assert!(
+            stdout.contains("ls-status=1\n"),
+            "ls should be denied for {directory}: {stdout}"
+        );
+        assert!(
+            stderr.contains("Operation not permitted"),
+            "ls should report Seatbelt denial for {directory}: {stderr}"
+        );
+    }
+}
+
+/// Metadata-only ancestor grants do not prevent listing an explicitly
+/// configured nested path.
+#[test]
+fn seatbelt_allows_listing_inside_read_path() {
+    let parent = tempfile::tempdir().unwrap();
+    let nested = fs::canonicalize(parent.path()).unwrap().join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("allowed.txt"), "allowed\n").unwrap();
+
+    let (stdout_r, stdout_w) = pipe_pair();
+    let (_stderr_r, stderr_w) = pipe_pair();
+    let mut cfg = base_config("darwin-allow-listing");
+    cfg.stdout = Some(stdout_w.as_raw_fd());
+    cfg.stderr = Some(stderr_w.as_raw_fd());
+    cfg.profile.read_paths = vec![nested.clone()];
+
+    let sb = new().unwrap();
+    let mut proc = sb
+        .launch(&cfg, "/bin/ls", &["-1", nested.to_str().unwrap()])
+        .unwrap();
+
+    drop(stdout_w);
+    drop(stderr_w);
+
+    let mut stdout = String::new();
+    stdout_r.take(4096).read_to_string(&mut stdout).unwrap();
+    let status = proc.wait().unwrap();
+    proc.cleanup();
+
+    assert!(status.success(), "allowed directory should be listable");
+    assert_eq!(stdout.trim(), "allowed.txt");
+}
+
 /// Seatbelt denies writes to read-only paths.
 ///
 /// Adds a temp dir to read_paths but NOT write_paths, then

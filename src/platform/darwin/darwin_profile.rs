@@ -146,7 +146,9 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
     writeln!(profile, "(allow signal (target self))").unwrap();
     writeln!(profile).unwrap();
 
-    // Root directory: dyld needs to stat "/" during process bootstrap.
+    // Root directory: dyld needs file-read* access to stat "/" during
+    // process bootstrap. Seatbelt requires the data grant here; narrowing it
+    // to metadata causes dyld to abort before main() runs.
     // Without this, the process receives SIGABRT before main() runs.
     writeln!(profile, "; Root directory (dyld bootstrap)").unwrap();
     writeln!(profile, "(allow file-read* (literal \"/\"))").unwrap();
@@ -169,7 +171,11 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
         "/private",
         "/private/var",
     ] {
-        writeln!(profile, "(allow file-read* (literal \"{ancestor}\"))").unwrap();
+        writeln!(
+            profile,
+            "(allow file-read-metadata (literal \"{ancestor}\"))"
+        )
+        .unwrap();
     }
     writeln!(profile).unwrap();
 
@@ -593,20 +599,22 @@ mod tests {
         // Verify deny-default.
         assert!(content.contains("(deny default)"));
 
-        // Verify root directory access for dyld bootstrap.
+        // Root requires a broad grant for dyld bootstrap. See the policy
+        // comment above; this is an unavoidable Seatbelt exception.
         assert!(content.contains("(allow file-read* (literal \"/\"))"));
 
         // Verify ancestor directories for path traversal.
-        assert!(content.contains("(allow file-read* (literal \"/opt\"))"));
-        assert!(content.contains("(allow file-read* (literal \"/etc\"))"));
+        assert!(content.contains("(allow file-read-metadata (literal \"/opt\"))"));
+        assert!(content.contains("(allow file-read-metadata (literal \"/etc\"))"));
         // /tmp and /var are symlinks to /private/tmp and /private/var;
         // their entries must be resolvable so tools that use the
         // non-canonical path (e.g. xcode-select via /var/select) work.
-        assert!(content.contains("(allow file-read* (literal \"/tmp\"))"));
-        assert!(content.contains("(allow file-read* (literal \"/var\"))"));
-        assert!(content.contains("(allow file-read* (literal \"/private\"))"));
-        assert!(content.contains("(allow file-read* (literal \"/Users\"))"));
-        assert!(content.contains("(allow file-read* (literal \"/private/var\"))"));
+        for ancestor in ["/tmp", "/var", "/private", "/Users", "/private/var"] {
+            assert!(content.contains(&format!(
+                "(allow file-read-metadata (literal \"{ancestor}\"))"
+            )));
+            assert!(!content.contains(&format!("(allow file-read* (literal \"{ancestor}\"))")));
+        }
 
         // Verify /private/var/select is readable (shell resolution).
         assert!(content.contains("(allow file-read* (subpath \"/private/var/select\"))"));
