@@ -1,10 +1,14 @@
-.PHONY: build release build-microvm release-microvm agent agent-release test test-unit test-integration lint fmt fmt-check clippy check ci ci-full audit header man clean static package install uninstall
+.PHONY: all build release build-microvm release-microvm agent agent-release test test-unit test-integration lint fmt fmt-check clippy check ci ci-full audit header man clean static package install uninstall
 
 FEATURES ?=
 PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
 LIBDIR  ?= $(PREFIX)/lib
+MANDIR  ?= $(PREFIX)/share/man
 DESTDIR ?=
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+all: release package man
 
 build:
 	cargo build $(if $(FEATURES),--features $(FEATURES))
@@ -116,26 +120,36 @@ package: header
 	test -s target/native-static-libs.txt || \
 	    { echo "ERROR: failed to capture native-static-libs"; exit 1; }
 
-# Install pre-built artifacts. Run 'make package' first (as non-root).
+# Install pre-built artifacts.  Installs whatever was produced by
+# 'make release' and/or 'make package'; skips anything not found.
 install:
-	@test -f target/release/libarapuca.a || \
-	    { echo "ERROR: target/release/libarapuca.a not found — run 'make package' first"; exit 1; }
-	@test -f include/arapuca.h || \
-	    { echo "ERROR: include/arapuca.h not found — run 'make header' first"; exit 1; }
-	@test -s target/native-static-libs.txt || \
-	    { echo "ERROR: target/native-static-libs.txt not found — run 'make package' first"; exit 1; }
-	install -d $(DESTDIR)$(LIBDIR)/pkgconfig
-	install -d $(DESTDIR)$(PREFIX)/include
-	install -m 644 target/release/libarapuca.a $(DESTDIR)$(LIBDIR)/
-	install -m 644 include/arapuca.h $(DESTDIR)$(PREFIX)/include/
-	sed -e 's|@PREFIX@|$(PREFIX)|g' \
-	    -e 's|@LIBDIR@|$(LIBDIR)|g' \
-	    -e 's|@VERSION@|$(VERSION)|g' \
-	    -e "s|@NATIVE_LIBS@|$$(cat target/native-static-libs.txt)|g" \
-	    -e 's|@INSTALL_FEATURES@|$(INSTALL_FEATURES)|g' \
-	    arapuca.pc.in > $(DESTDIR)$(LIBDIR)/pkgconfig/arapuca.pc
+	@for bin in arapuca arapuca-agent; do \
+		test ! -f target/release/$$bin || \
+		    { install -d $(DESTDIR)$(BINDIR) && \
+		      install -m 755 target/release/$$bin $(DESTDIR)$(BINDIR)/; }; \
+	done
+	@test ! -f target/release/libarapuca.a || \
+	    { install -d $(DESTDIR)$(LIBDIR) && \
+	      install -m 644 target/release/libarapuca.a $(DESTDIR)$(LIBDIR)/; }
+	@test ! -f include/arapuca.h || \
+	    { install -d $(DESTDIR)$(PREFIX)/include && \
+	      install -m 644 include/arapuca.h $(DESTDIR)$(PREFIX)/include/; }
+	@test ! -f target/release/libarapuca.a || test ! -s target/native-static-libs.txt || \
+	    { install -d $(DESTDIR)$(LIBDIR)/pkgconfig && \
+	      sed -e 's|@PREFIX@|$(PREFIX)|g' \
+	          -e 's|@LIBDIR@|$(LIBDIR)|g' \
+	          -e 's|@VERSION@|$(VERSION)|g' \
+	          -e "s|@NATIVE_LIBS@|$$(cat target/native-static-libs.txt)|g" \
+	          -e 's|@INSTALL_FEATURES@|$(INSTALL_FEATURES)|g' \
+	          arapuca.pc.in > $(DESTDIR)$(LIBDIR)/pkgconfig/arapuca.pc; }
+	@test ! -f doc/arapuca.1 || \
+	    { install -d $(DESTDIR)$(MANDIR)/man1 && \
+	      install -m 644 doc/arapuca.1 $(DESTDIR)$(MANDIR)/man1/; }
 
 uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/arapuca
+	rm -f $(DESTDIR)$(BINDIR)/arapuca-agent
 	rm -f $(DESTDIR)$(LIBDIR)/libarapuca.a
 	rm -f $(DESTDIR)$(PREFIX)/include/arapuca.h
 	rm -f $(DESTDIR)$(LIBDIR)/pkgconfig/arapuca.pc
+	rm -f $(DESTDIR)$(MANDIR)/man1/arapuca.1

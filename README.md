@@ -718,18 +718,46 @@ cargo +nightly fuzz list
 cargo +nightly fuzz run sanitize_task_id fuzz/seeds/sanitize_task_id
 ```
 
+### Installing
+
+```bash
+# Build everything (release binaries, C library, man page) and install
+make all
+sudo make install
+
+# Or install just the release binaries
+make release
+sudo make install
+
+# Custom prefix (default is /usr/local)
+make release
+sudo make install PREFIX=/opt/arapuca
+
+# Uninstall
+sudo make uninstall
+```
+
+The `install` target installs whatever release artifacts were produced:
+binaries to `$(PREFIX)/bin`, libraries to `$(PREFIX)/lib`, headers to
+`$(PREFIX)/include`, and the man page to `$(PREFIX)/share/man/man1`.
+Artifacts not found are silently skipped.
+
 ### Requirements
 
-- Rust 1.85+ (edition 2024)
-- **Linux**: kernel 5.13+ (Landlock) — degrades gracefully on older
-  kernels; cgroups v2 with delegated controllers (for resource limits)
-- **Linux (microvm feature)**: libkrun + libkrunfw, qemu-img,
-  qemu-nbd (for image probing), OpenSSL development headers, and
-  optionally passt (for VM networking). KVM (`/dev/kvm`) required.
-- **macOS**: `sandbox-exec` (ships with macOS, deprecated but functional
-  through macOS 15)
-- **Windows**: Windows 10+ (64-bit only) — AppContainers require
-  user-mode profile creation (no admin required)
+- Rust 1.85+ (edition 2024) with `cargo`, `rustfmt`,
+  `clippy`
+- `gcc`, `make`, `cbindgen`, `pandoc`
+- **Linux**: kernel 5.13+ (Landlock) — degrades gracefully
+  on older kernels; cgroups v2 with delegated controllers
+  (for resource limits)
+- **Linux (microvm feature)**: libkrun + libkrunfw,
+  qemu-img, qemu-nbd (for image probing), OpenSSL
+  development headers, and optionally passt (for VM
+  networking). KVM (`/dev/kvm`) required
+- **macOS**: `sandbox-exec` (ships with macOS, deprecated
+  but functional through macOS 15)
+- **Windows**: Windows 10+ (64-bit only) — AppContainers
+  require user-mode profile creation (no admin required)
 
 ## Project Structure
 
