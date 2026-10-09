@@ -85,6 +85,62 @@ fn default_paths_sufficient_for_basic_commands() {
     assert!(status.success(), "/bin/true should succeed with defaults");
 }
 
+#[test]
+fn allow_network_listeners_confines_tcp_to_netns_loopback() {
+    if !arapuca::netns::available() {
+        eprintln!("skipping listener namespace test: unprivileged netns unavailable");
+        return;
+    }
+
+    let test_binary = std::env::current_exe().unwrap();
+    let test_binary_dir = test_binary.parent().unwrap();
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--allow-network-listeners",
+            "-v",
+            &format!("{}:ro", test_binary_dir.display()),
+            "--env",
+            "ARKAI_ARAPUCA_TEST_LISTENER_HELPER=1",
+            "--",
+        ])
+        .arg(&test_binary)
+        .args(["--exact", "network_listener_helper", "--nocapture"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "listener helper failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn network_listener_helper() {
+    if std::env::var_os("ARKAI_ARAPUCA_TEST_LISTENER_HELPER").is_none() {
+        return;
+    }
+
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("namespace loopback should work");
+    let client = TcpStream::connect(listener.local_addr().unwrap())
+        .expect("namespace loopback connect should work");
+    let (accepted, _) = listener
+        .accept()
+        .expect("namespace loopback accept should work");
+    drop((client, accepted));
+
+    let external = TcpStream::connect_timeout(
+        &"203.0.113.1:443".parse().unwrap(),
+        Duration::from_millis(250),
+    );
+    assert!(external.is_err(), "external egress must remain isolated");
+}
+
 // ─── Functional tests ────────────────────────────────────────
 
 #[test]

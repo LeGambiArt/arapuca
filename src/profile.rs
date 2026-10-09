@@ -242,6 +242,15 @@ pub struct Profile {
     /// the invoking user can. Enable only for trusted tools that need
     /// Keychain-backed credentials.
     pub allow_keychain: bool,
+    /// Allow the process to bind and accept TCP connections.
+    ///
+    /// Off by default. Seatbelt's network address filters do not provide a
+    /// reliable loopback-only bind/inbound boundary: the `localhost` matcher
+    /// can also permit wildcard binds. Enable only for trusted applications
+    /// that need a local listener. On Linux this enables an isolated network
+    /// namespace with loopback up and baseline seccomp so listeners remain
+    /// confined to that namespace.
+    pub allow_network_listeners: bool,
 }
 
 impl Profile {

@@ -365,10 +365,14 @@ pub fn wrapper_env(profile: &crate::Profile) -> crate::Result<Vec<(String, Strin
     // Always emit — never rely on absence encoding a default.
     // Linux::launch() calls env_clear() so ambient vars don't leak,
     // but defense-in-depth: explicit is better than implicit.
-    env.push((
-        "ARAPUCA_SECCOMP_PROFILE".into(),
-        profile.seccomp_profile.as_str().into(),
-    ));
+    let seccomp_profile = if cfg!(target_os = "linux") && profile.allow_network_listeners {
+        // AF_INET/AF_INET6 are required for loopback listeners. The network
+        // namespace below remains the actual egress boundary.
+        crate::SeccompProfile::Baseline.as_str()
+    } else {
+        profile.seccomp_profile.as_str()
+    };
+    env.push(("ARAPUCA_SECCOMP_PROFILE".into(), seccomp_profile.into()));
     env.push((
         "ARAPUCA_ALLOW_EXEC".into(),
         if profile.allow_exec { "1" } else { "0" }.into(),
@@ -377,6 +381,9 @@ pub fn wrapper_env(profile: &crate::Profile) -> crate::Result<Vec<(String, Strin
         "ARAPUCA_DENY_UNIX_SOCKETS".into(),
         if profile.deny_unix_sockets { "1" } else { "0" }.into(),
     ));
+    if profile.allow_network_listeners {
+        env.push(("ARAPUCA_ALLOW_NETWORK_LISTENERS".into(), "1".into()));
+    }
     if profile.seccomp_debug {
         env.push(("ARAPUCA_SECCOMP_DEBUG".into(), "1".into()));
     }
@@ -958,6 +965,23 @@ mod tests {
         assert_eq!(map.get("ARAPUCA_RLIMIT_NOFILE"), Some(&"1024"));
         assert_eq!(map.get("ARAPUCA_READ_PATHS"), Some(&"/usr"));
         assert!(!map.contains_key("ARAPUCA_RLIMIT_NPROC"));
+    }
+
+    #[test]
+    fn wrapper_env_marks_network_listener_permission() {
+        let profile = crate::Profile {
+            allow_network_listeners: true,
+            ..Default::default()
+        };
+        let env = wrapper_env(&profile).unwrap();
+        let map: std::collections::HashMap<&str, &str> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(map.get("ARAPUCA_ALLOW_NETWORK_LISTENERS"), Some(&"1"));
+        if cfg!(target_os = "linux") {
+            assert_eq!(map.get("ARAPUCA_SECCOMP_PROFILE"), Some(&"baseline"));
+        } else {
+            assert_eq!(map.get("ARAPUCA_SECCOMP_PROFILE"), Some(&"strict"));
+        }
     }
 
     #[cfg(unix)]

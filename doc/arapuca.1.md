@@ -110,6 +110,16 @@ preserved.
     CGNAT, link-local, and cloud metadata addresses are rejected to
     prevent DNS rebinding SSRF). Linux only.
 
+**-\-allow-network-listeners**
+:   Allow TCP bind and inbound connections. Off by default. On Linux this
+    enables a network namespace with loopback up and baseline seccomp; the
+    namespace keeps listeners off the host network. On macOS, Seatbelt's
+    network address filters cannot reliably limit listeners to loopback:
+    the rule may permit wildcard binds and inbound connections on host
+    interfaces. Use only for trusted programs. This option does not enable
+    general outbound access; outbound policy remains controlled separately.
+    Cannot be combined with **--deny-network**.
+
 **-t**, **-\-tty**
 :   Allocate a pseudo-terminal (PTY) for the sandboxed process. Enables
     interactive programs (shells, editors, TUI applications) that require

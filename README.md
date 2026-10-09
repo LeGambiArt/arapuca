@@ -201,6 +201,7 @@ arapuca run \
 | `--task-id NAME` | Identifier for cgroup and audit |
 | `--allow-host H:P` | Allow HTTPS to host:port or `*.domain:port` via CONNECT proxy (Linux) |
 | `--deny-network` | Block all network; capture DNS queries as audit events (Linux) |
+| `--allow-network-listeners` | Allow TCP bind/inbound; on Linux confines listeners to an isolated network namespace. On macOS, Seatbelt cannot reliably confine listeners to loopback, so use only with trusted programs. |
 | `--seccomp MODE` | Seccomp profile: `strict` (default) or `baseline` |
 | `--audit-files` | Emit file access and process spawn audit events (Linux) |
 | `--audit-network` | Emit network connection audit events (Linux) |

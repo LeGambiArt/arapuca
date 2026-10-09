@@ -89,6 +89,26 @@ fn bogus_flag_rejected() {
 }
 
 #[test]
+fn deny_network_with_allow_network_listeners_rejected() {
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--deny-network",
+            "--allow-network-listeners",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--deny-network and --allow-network-listeners are mutually exclusive"),
+        "should reject combination, got: {stderr}"
+    );
+}
+
+#[test]
 fn unknown_subcommand_rejected() {
     let output = Command::new(arapuca_bin())
         .args(["foo", "--", "/bin/true"])

@@ -252,6 +252,19 @@ void arapuca_profile_set_cpu_timeout(struct arapuca_ArapucaProfile *profile, uin
 void arapuca_profile_set_netns(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
+ * Allow the sandboxed process to bind and accept TCP connections.
+ *
+ * On macOS, Seatbelt cannot guarantee that listeners are confined to
+ * loopback; enable only for trusted applications. On Linux, listeners are
+ * confined to the isolated network namespace.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_network_listeners(struct arapuca_ArapucaProfile *profile,
+                                           bool enabled);
+
+/**
  * Set the seccomp profile for the sandboxed process.
  *
  * `profile_str` must be a null-terminated string: `"strict"` (default)
