@@ -305,6 +305,26 @@ pub unsafe extern "C" fn arapuca_profile_set_netns(profile: *mut ArapucaProfile,
     }
 }
 
+/// Allow the sandboxed process to bind and accept TCP connections.
+///
+/// On macOS, Seatbelt cannot guarantee that listeners are confined to
+/// loopback; enable only for trusted applications. On Linux, listeners are
+/// confined to the isolated network namespace.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_network_listeners(
+    profile: *mut ArapucaProfile,
+    enabled: bool,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.allow_network_listeners = enabled;
+        }
+    }
+}
+
 /// Set the seccomp profile for the sandboxed process.
 ///
 /// `profile_str` must be a null-terminated string: `"strict"` (default)
@@ -1528,6 +1548,18 @@ mod tests {
         let p = arapuca_profile_new();
         assert!(!p.is_null());
         unsafe { arapuca_profile_free(p) };
+    }
+
+    #[test]
+    fn profile_set_network_listeners() {
+        let p = arapuca_profile_new();
+        assert!(!p.is_null());
+        unsafe {
+            assert!(!(*p).inner.as_ref().unwrap().allow_network_listeners);
+            arapuca_profile_set_network_listeners(p, true);
+            assert!((*p).inner.as_ref().unwrap().allow_network_listeners);
+            arapuca_profile_free(p);
+        }
     }
 
     #[test]

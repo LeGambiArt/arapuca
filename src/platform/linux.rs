@@ -301,7 +301,9 @@ impl Sandbox for Linux {
 
         // When allowed_hosts is set, network namespace isolation is
         // implicitly enabled (the proxy only makes sense inside netns).
-        let effective_use_netns = cfg.profile.use_netns || connect_proxy_socket_local.is_some();
+        let effective_use_netns = cfg.profile.use_netns
+            || cfg.profile.allow_network_listeners
+            || connect_proxy_socket_local.is_some();
 
         // ── DNS capture eligibility ────────────────────────────────
         let mount_ns_ok =

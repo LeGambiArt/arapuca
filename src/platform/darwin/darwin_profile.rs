@@ -40,6 +40,9 @@ pub struct ProfileData {
     /// Keychain reads fail silently and Keychain-backed authentication
     /// reports "not logged in".
     pub allow_keychain: bool,
+    /// Allow TCP listeners. macOS Seatbelt cannot strictly scope the bind
+    /// permission to loopback, so this is intended only for trusted programs.
+    pub allow_network_listeners: bool,
     /// Allow ioctl on PTY slave devices.
     ///
     /// When true, the profile grants `file-ioctl` scoped to `/dev/ttys*`
@@ -364,6 +367,27 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
         writeln!(profile).unwrap();
     }
 
+    // TCP listener access is a separate opt-in from outbound networking.
+    // Seatbelt's `localhost` address matcher is not a reliable loopback-only
+    // guard for bind/inbound: in particular, wildcard binds may still match.
+    // Keep the default deny and outbound policy unchanged, and make this
+    // capability explicit for trusted programs that need local servers.
+    if data.allow_network_listeners {
+        writeln!(profile, "; TCP listeners (--allow-network-listeners)").unwrap();
+        writeln!(profile, "(allow network-bind (local ip \"localhost:*\"))").unwrap();
+        writeln!(
+            profile,
+            "(allow network-inbound (local ip \"localhost:*\"))"
+        )
+        .unwrap();
+        writeln!(
+            profile,
+            "(allow network-outbound (remote ip \"localhost:*\"))"
+        )
+        .unwrap();
+        writeln!(profile).unwrap();
+    }
+
     // Socket permissions in network mode (scoped to configured paths).
     if data.allow_network && (data.control_socket.is_some() || data.llm_socket.is_some()) {
         if let Some(ref s) = data.control_socket {
@@ -590,6 +614,7 @@ mod tests {
             llm_socket: Some("/tmp/sock/llm.sock".into()),
             allow_network: false,
             allow_keychain: false,
+            allow_network_listeners: false,
             tty: false,
         };
 
@@ -689,6 +714,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            allow_network_listeners: false,
             tty: true,
         };
 
@@ -698,6 +724,45 @@ mod tests {
         assert!(content.contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_generate_profile_network_listeners_are_opt_in() {
+        let base_dir = std::env::temp_dir().join("arapuca-test-profile-listeners-off");
+        let listeners_dir = std::env::temp_dir().join("arapuca-test-profile-listeners-on");
+        let _ = std::fs::create_dir_all(&base_dir);
+        let _ = std::fs::create_dir_all(&listeners_dir);
+
+        let base = ProfileData {
+            read_paths: vec!["/home/user/src".into()],
+            write_paths: vec![],
+            exec_paths: vec![],
+            control_socket: None,
+            llm_socket: None,
+            allow_network: false,
+            allow_keychain: false,
+            allow_network_listeners: false,
+            tty: false,
+        };
+        let base_path = generate_profile(&base_dir, &base).unwrap();
+        let base_content = std::fs::read_to_string(base_path).unwrap();
+        assert!(!base_content.contains("network-bind"));
+        assert!(!base_content.contains("network-inbound"));
+        assert!(!base_content.contains("(allow network-outbound (remote ip"));
+
+        let listeners = ProfileData {
+            allow_network_listeners: true,
+            ..base
+        };
+        let listeners_path = generate_profile(&listeners_dir, &listeners).unwrap();
+        let listeners_content = std::fs::read_to_string(listeners_path).unwrap();
+        assert!(listeners_content.contains("(allow network-bind (local ip \"localhost:*\"))"));
+        assert!(listeners_content.contains("(allow network-inbound (local ip \"localhost:*\"))"));
+        assert!(listeners_content.contains("(allow network-outbound (remote ip \"localhost:*\"))"));
+        assert!(!listeners_content.contains("(allow network-outbound (remote tcp))"));
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let _ = std::fs::remove_dir_all(&listeners_dir);
     }
 
     #[test]
@@ -734,6 +799,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            allow_network_listeners: false,
             tty: false,
         };
         let path = generate_profile(&dir, &data).unwrap();
@@ -768,6 +834,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            allow_network_listeners: false,
             tty: false,
         };
 
@@ -791,6 +858,7 @@ mod tests {
             llm_socket: None,
             allow_network: true,
             allow_keychain: false,
+            allow_network_listeners: false,
             tty: false,
         };
 
@@ -865,6 +933,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            allow_network_listeners: false,
             tty: false,
         };
         let content_off =
@@ -902,6 +971,7 @@ mod tests {
             llm_socket: None,
             allow_network: true,
             allow_keychain: true,
+            allow_network_listeners: false,
             tty: false,
         };
         let content_both =
@@ -934,6 +1004,7 @@ mod tests {
             llm_socket: Some("/tmp/sock/proxy.sock".into()),
             allow_network: false,
             allow_keychain: false,
+            allow_network_listeners: false,
             tty: false,
         };
 

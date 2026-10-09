@@ -311,6 +311,20 @@ fn main() {
         }
         audit_layer(audit_fd, "Landlock", true, None);
 
+        // A fresh network namespace starts with loopback down. Bring it up
+        // before seccomp so the explicitly enabled listener capability is
+        // usable without exposing the host network interfaces.
+        if std::env::var("ARAPUCA_ALLOW_NETWORK_LISTENERS").as_deref() == Ok("1") {
+            #[cfg(target_os = "linux")]
+            if let Err(e) = arapuca::bridge::loopback_up() {
+                audit_layer(audit_fd, "Loopback", false, Some(&e.to_string()));
+                eprintln!("arapuca: loopback: {e}");
+                std::process::exit(1);
+            }
+            #[cfg(target_os = "linux")]
+            audit_layer(audit_fd, "Loopback", true, None);
+        }
+
         // Bridge: fork a TCP-to-UDS relay before seccomp is applied.
         // Activated when ARAPUCA_PROXY_BRIDGE=<port>:<uds_path> is set.
         match arapuca::bridge::parse_bridge_env() {
@@ -633,6 +647,7 @@ fn run_subcommand(args: &[String]) {
     let mut audit_network = false;
     let mut allow_proxy_env = false;
     let mut allow_keychain = false;
+    let mut allow_network_listeners = false;
     let mut lpac = false;
 
     // Find -- separator.
@@ -678,6 +693,10 @@ fn run_subcommand(args: &[String]) {
             eprintln!(
                 "  --allow-keychain   allow macOS Keychain access; sets HOME to your \
                  home dir (macOS only)"
+            );
+            eprintln!(
+                "  --allow-network-listeners  allow TCP bind/inbound (macOS Seatbelt cannot \
+                 strictly confine listeners to loopback)"
             );
             eprintln!("  -t, --tty          allocate a PTY for interactive programs");
             if sep_pos.is_none() && !args.is_empty() {
@@ -893,6 +912,11 @@ fn run_subcommand(args: &[String]) {
                      (macOS Keychain only)"
                 );
             }
+            "--allow-network-listeners" => {
+                allow_network_listeners = true;
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                eprintln!("arapuca run: --allow-network-listeners has no effect on this platform");
+            }
             "--audit-network" => {
                 audit_network = true;
             }
@@ -929,6 +953,12 @@ fn run_subcommand(args: &[String]) {
     .validate_unix_socket_policy()
     {
         eprintln!("arapuca run: {e}");
+        std::process::exit(125);
+    }
+    if deny_network && allow_network_listeners {
+        eprintln!(
+            "arapuca run: --deny-network and --allow-network-listeners are mutually exclusive"
+        );
         std::process::exit(125);
     }
     #[cfg(target_os = "linux")]
@@ -1010,7 +1040,7 @@ fn run_subcommand(args: &[String]) {
         std::process::exit(125);
     });
 
-    let use_netns = connect_proxy_socket.is_some() || deny_network;
+    let use_netns = connect_proxy_socket.is_some() || deny_network || allow_network_listeners;
     let profile = arapuca::Profile {
         read_paths,
         write_paths,
@@ -1029,6 +1059,7 @@ fn run_subcommand(args: &[String]) {
         seccomp_debug,
         allow_proxy_env,
         allow_keychain,
+        allow_network_listeners,
         ..Default::default()
     };
 

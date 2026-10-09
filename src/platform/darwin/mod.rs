@@ -219,8 +219,12 @@ impl Sandbox for Darwin {
                 })?;
             }
 
-            let network_detail = if allow_network {
+            let network_detail = if allow_network && cfg.profile.allow_network_listeners {
+                "network=allowed,listeners=enabled"
+            } else if allow_network {
                 "network=allowed"
+            } else if cfg.profile.allow_network_listeners {
+                "network=listeners-enabled"
             } else if proxy_mode {
                 "network=proxy-only"
             } else {
@@ -376,6 +380,7 @@ impl Sandbox for Darwin {
             llm_socket,
             allow_network,
             allow_keychain: cfg.profile.allow_keychain,
+            allow_network_listeners: cfg.profile.allow_network_listeners,
             tty: cfg.tty,
         };
 
