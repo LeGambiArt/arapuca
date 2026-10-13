@@ -109,6 +109,21 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         std::env::var_os("ARAPUCA_AUDIT_FD").and_then(|v| v.to_str().and_then(|s| s.parse().ok()));
 
     let seccomp_debug = std::env::var("ARAPUCA_SECCOMP_DEBUG").as_deref() == Ok("1");
+    let deny_unix_sockets = crate::wrapper::deny_unix_sockets_from_env().unwrap_or_else(|e| {
+        write_stderr(&format!("arapuca: selfexec: {e}\n"));
+        unsafe { libc::_exit(1) };
+    });
+    if let Err(e) = crate::wrapper::validate_unix_socket_policy(
+        &crate::Profile {
+            deny_unix_sockets,
+            ..Default::default()
+        },
+        false,
+    ) {
+        audit_layer(audit_fd, "UnixSocketPolicy", false, Some(&e.to_string()));
+        write_stderr(&format!("arapuca: selfexec: {e}\n"));
+        unsafe { libc::_exit(1) };
+    }
 
     // ── Resolve command path before Landlock ─────────────────────
     let cmd = if std::fs::metadata(cmd).is_ok() {
@@ -247,6 +262,7 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
             read_paths,
             write_paths,
             allow_exec,
+            deny_unix_sockets,
             ..Default::default()
         };
 
@@ -366,7 +382,7 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
             Some(v) if v == OsStr::new("baseline") => crate::SeccompProfile::Baseline,
             _ => crate::SeccompProfile::Strict,
         };
-        if let Err(e) = crate::seccomp::apply(&seccomp_profile) {
+        if let Err(e) = crate::seccomp::apply(&seccomp_profile, deny_unix_sockets) {
             audit_layer(audit_fd, "Seccomp", false, Some(&e.to_string()));
             write_stderr(&format!("arapuca: selfexec: seccomp: {e}\n"));
             unsafe { libc::_exit(1) };

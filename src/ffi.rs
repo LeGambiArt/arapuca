@@ -1162,8 +1162,33 @@ pub unsafe extern "C" fn arapuca_process_cleanup(proc_: *mut ArapucaProcess) {
 
 // ─── Apply API ──────────────────────────────────────────────────────
 
+/// Enable Unix socket denial (Linux x86_64/aarch64 process isolation only).
+/// Unsupported enabled requests fail at launch/application.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_deny_unix_sockets(
+    profile: *mut ArapucaProfile,
+    enabled: bool,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.deny_unix_sockets = enabled;
+        }
+    }
+}
+
 /// Apply sandbox restrictions to the current process. Fail-closed.
 /// Returns 0 on success, -1 on error.
+///
+/// With Unix socket denial enabled, apply before untrusted execution in a
+/// single-threaded process with exclusive FD-table ownership. No signal
+/// handler may change descriptors during application. The caller must have
+/// torn down all usable pre-existing io_uring contexts/submission mappings,
+/// including descriptor-less registered rings and outstanding asynchronous
+/// work. FD scanning cannot establish their absence; use fresh-exec launch
+/// when these preconditions cannot be guaranteed.
 ///
 /// # Safety
 /// `profile` must be a valid pointer.
@@ -1178,6 +1203,11 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
         set_error("profile already freed");
         return -1;
     };
+
+    if let Err(e) = crate::wrapper::validate_unix_socket_policy(inner, true) {
+        set_error(&e.to_string());
+        return -1;
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -1196,7 +1226,7 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
         return -1;
     }
     #[cfg(seccomp_supported)]
-    if let Err(e) = crate::seccomp::apply(&inner.seccomp_profile) {
+    if let Err(e) = crate::seccomp::apply(&inner.seccomp_profile, inner.deny_unix_sockets) {
         set_error(&format!("seccomp: {e}"));
         return -1;
     }

@@ -26,6 +26,14 @@ use std::path::PathBuf;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    if args.get(1).is_some_and(|a| a == "--wrapper-capabilities") {
+        if args.len() != 2 || !cfg!(seccomp_supported) {
+            std::process::exit(1);
+        }
+        print!("{}", arapuca::wrapper::UNIX_SOCKET_CAPABILITY);
+        return;
+    }
+
     // Dispatch subcommands before the sandbox path.
     if args.get(1).is_some_and(|a| a == "image") {
         image_subcommand(&args[2..]);
@@ -112,6 +120,28 @@ fn main() {
     if std::env::var("ARAPUCA_WRAPPER").as_deref() != Ok("1") {
         eprintln!("arapuca: wrapper path requires library invocation (ARAPUCA_WRAPPER not set)");
         eprintln!("hint: use `arapuca run -- command` instead");
+        std::process::exit(1);
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Err(e) = arapuca::wrapper::close_wrapper_exec_fd() {
+        eprintln!("arapuca: {e}");
+        std::process::exit(1);
+    }
+    let deny_unix_sockets = arapuca::wrapper::deny_unix_sockets_from_env().unwrap_or_else(|e| {
+        eprintln!("arapuca: {e}");
+        std::process::exit(1);
+    });
+    if let Err(e) = arapuca::wrapper::validate_unix_socket_policy(
+        &arapuca::Profile {
+            deny_unix_sockets,
+            ..Default::default()
+        },
+        false,
+    ) {
+        #[cfg(unix)]
+        audit_layer(audit_fd, "UnixSocketPolicy", false, Some(&e.to_string()));
+        eprintln!("arapuca: {e}");
         std::process::exit(1);
     }
 
@@ -213,6 +243,7 @@ fn main() {
             read_paths,
             write_paths,
             allow_exec,
+            deny_unix_sockets,
             ..Default::default()
         };
 
@@ -395,7 +426,7 @@ fn main() {
                 Ok("baseline") => arapuca::SeccompProfile::Baseline,
                 _ => arapuca::SeccompProfile::Strict,
             };
-            if let Err(e) = arapuca::seccomp::apply(&seccomp_profile) {
+            if let Err(e) = arapuca::seccomp::apply(&seccomp_profile, deny_unix_sockets) {
                 audit_layer(audit_fd, "Seccomp", false, Some(&e.to_string()));
                 eprintln!("arapuca: seccomp: {e}");
                 std::process::exit(1);
@@ -589,6 +620,7 @@ fn run_subcommand(args: &[String]) {
     let mut task_id: Option<String> = None;
     let mut cwd: Option<PathBuf> = None;
     let mut seccomp_profile = arapuca::SeccompProfile::Strict;
+    let mut deny_unix_sockets = false;
     #[cfg(unix)]
     let mut tty = false;
     #[cfg(target_os = "linux")]
@@ -636,6 +668,7 @@ fn run_subcommand(args: &[String]) {
             eprintln!("                     (proxy routing only; TLS trust-anchor vars such as");
             eprintln!("                     SSL_CERT_FILE/CURL_CA_BUNDLE are not forwarded)");
             eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
+            eprintln!("  --no-unix-sockets  deny Unix sockets (Linux x86_64/aarch64 only)");
             eprintln!("  --no-pid-ns        disable PID namespace isolation");
             eprintln!("  --lpac             run as a Less Privileged AppContainer (Windows only);");
             eprintln!(
@@ -833,6 +866,9 @@ fn run_subcommand(args: &[String]) {
             "--no-pid-ns" => {
                 no_pid_ns = true;
             }
+            "--no-unix-sockets" => {
+                deny_unix_sockets = true;
+            }
             "--lpac" => {
                 lpac = true;
                 #[cfg(not(windows))]
@@ -886,6 +922,15 @@ fn run_subcommand(args: &[String]) {
     }
 
     // ── Flag validation ────────────────────────────────────────
+    if let Err(e) = (arapuca::Profile {
+        deny_unix_sockets,
+        ..Default::default()
+    })
+    .validate_unix_socket_policy()
+    {
+        eprintln!("arapuca run: {e}");
+        std::process::exit(125);
+    }
     #[cfg(target_os = "linux")]
     if deny_network && !allowed_hosts.is_empty() {
         eprintln!("arapuca run: --deny-network and --allow-host are mutually exclusive");
@@ -978,6 +1023,7 @@ fn run_subcommand(args: &[String]) {
         dns_capture: deny_network,
         lpac,
         seccomp_profile,
+        deny_unix_sockets,
         audit_file_access: audit_files,
         audit_network: audit_network || deny_network,
         seccomp_debug,

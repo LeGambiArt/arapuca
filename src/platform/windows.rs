@@ -91,6 +91,7 @@ impl Windows {
 
 impl Sandbox for Windows {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
+        cfg.profile.validate_unix_socket_policy()?;
         crate::sanitize_task_id(&cfg.task_id)?;
 
         let tmp_dir = crate::env::make_tmp_dir(&cfg.task_id)?;

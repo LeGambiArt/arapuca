@@ -130,6 +130,7 @@ pub enum AuditEvent {
         tier1_kill_count: usize,
         tier2_eperm_count: usize,
         socket_filter: bool,
+        deny_unix_sockets: bool,
         prctl_filter: bool,
         clone_ns_filter: bool,
         clone3_enosys: bool,

@@ -174,6 +174,11 @@ pub struct Profile {
     pub lpac: bool,
     /// Seccomp filter profile. Defaults to Strict.
     pub seccomp_profile: SeccompProfile,
+    /// Deny Unix socket creation and retained Unix sockets/io_uring rings.
+    /// Off by default; applies to both seccomp profiles. Supported only by
+    /// Linux x86_64/aarch64 process isolation. Unsupported requests fail.
+    /// Runtimes using Unix sockets or socketpairs may require this off.
+    pub deny_unix_sockets: bool,
     /// Audit file access via seccomp user notification.
     ///
     /// Intercepts `openat`/`openat2`/`open`/`execve` syscalls and emits
@@ -237,6 +242,43 @@ pub struct Profile {
     /// the invoking user can. Enable only for trusted tools that need
     /// Keychain-backed credentials.
     pub allow_keychain: bool,
+}
+
+impl Profile {
+    /// Validate availability of an explicitly requested Unix socket policy.
+    pub fn validate_unix_socket_policy(&self) -> crate::Result<()> {
+        if self.deny_unix_sockets
+            && (!cfg!(seccomp_supported) || !matches!(self.isolation, Isolation::Process))
+        {
+            return Err(crate::Error::Validation(
+                "Unix socket denial requires Linux x86_64/aarch64 process isolation".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod unix_policy_tests {
+    use super::*;
+
+    #[test]
+    fn explicitly_requested_policy_requires_a_supported_backend() {
+        let mut profile = Profile::default();
+        assert!(profile.validate_unix_socket_policy().is_ok());
+        profile.deny_unix_sockets = true;
+        assert_eq!(
+            profile.validate_unix_socket_policy().is_ok(),
+            cfg!(seccomp_supported)
+        );
+        profile.isolation = Isolation::MicroVm(MicroVmConfig {
+            image: ImageSource::Path(PathBuf::from("/unused")),
+            cpus: 1,
+            mem_mb: 128,
+            write_files: vec![],
+        });
+        assert!(profile.validate_unix_socket_policy().is_err());
+    }
 }
 
 /// Full configuration for launching a sandboxed process.

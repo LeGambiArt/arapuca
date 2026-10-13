@@ -160,6 +160,7 @@ impl Darwin {
 
 impl Sandbox for Darwin {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
+        cfg.profile.validate_unix_socket_policy()?;
         // Validate task ID and work directory.
         crate::sanitize_task_id(&cfg.task_id)?;
         crate::validate_work_dir(
