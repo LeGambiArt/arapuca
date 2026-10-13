@@ -106,6 +106,170 @@ fn build_x32_guard() -> Option<BpfProgram> {
     }
 }
 
+// ─── Retained-resource validation ─────────────────────────────────
+//
+// When deny_unix_sockets is enabled, these helpers validate that the
+// process holds no retained AF_UNIX sockets or io_uring ring FDs
+// before seccomp filters are installed. Called from the wrapper
+// trampolines and the direct-apply FFI entry point.
+
+/// Validate that no inherited file descriptor is an AF_UNIX socket
+/// or an io_uring ring.
+///
+/// Enumerates `/proc/self/fd` and inspects each descriptor:
+/// - Sockets: `getsockopt(SO_DOMAIN)` — rejects `AF_UNIX`.
+/// - io_uring rings: `/proc/self/fd/<n>` readlink target starts with
+///   `anon_inode:[io_uring]`.
+/// - Pipes, regular files, char devices: accepted (ENOTSOCK is expected).
+///
+/// Fails closed: directory-open, iteration, parsing, and unexpected
+/// inspection errors reject application. Only `ENOTSOCK` from
+/// `getsockopt` is an expected non-socket result (the descriptor is
+/// then checked for io_uring identity).
+///
+/// The caller must ensure no concurrent descriptor-table mutations
+/// (single-threaded context or exclusive ownership).
+#[allow(dead_code)] // Callers wired in the next commit.
+pub(crate) fn validate_no_retained_unix_resources() -> crate::Result<()> {
+    let fd_dir = std::fs::read_dir("/proc/self/fd").map_err(|e| {
+        Error::Validation(format!(
+            "deny_unix_sockets: cannot enumerate /proc/self/fd: {e}"
+        ))
+    })?;
+
+    // Keep the directory open through the entire scan so its own
+    // descriptor does not become a stale entry.
+    for entry in fd_dir {
+        let entry = entry.map_err(|e| {
+            Error::Validation(format!(
+                "deny_unix_sockets: /proc/self/fd iteration error: {e}"
+            ))
+        })?;
+
+        let name = entry.file_name();
+        let fd_str = name.to_string_lossy();
+        let fd: i32 = fd_str.parse().map_err(|_| {
+            Error::Validation(format!(
+                "deny_unix_sockets: unexpected /proc/self/fd entry: {fd_str}"
+            ))
+        })?;
+
+        // Check if it's a socket and what domain it has.
+        let mut domain: libc::c_int = 0;
+        let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_DOMAIN,
+                &mut domain as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+
+        if ret == 0 {
+            // It's a socket — reject AF_UNIX.
+            if domain == libc::AF_UNIX {
+                return Err(Error::Validation(format!(
+                    "deny_unix_sockets: inherited AF_UNIX socket on fd {fd}"
+                )));
+            }
+            // Non-AF_UNIX socket (e.g. AF_INET) — accepted.
+            continue;
+        }
+
+        // getsockopt failed — check why.
+        let errno = std::io::Error::last_os_error();
+        let raw = errno.raw_os_error().unwrap_or(0);
+
+        if raw == libc::ENOTSOCK {
+            // Not a socket. Check if it's an io_uring ring FD via
+            // /proc/self/fd/<n> readlink target.
+            let link_path = format!("/proc/self/fd/{fd}");
+            match std::fs::read_link(&link_path) {
+                Ok(target) => {
+                    let target_str = target.to_string_lossy();
+                    if target_str.starts_with("anon_inode:[io_uring]") {
+                        return Err(Error::Validation(format!(
+                            "deny_unix_sockets: inherited io_uring ring on fd {fd}"
+                        )));
+                    }
+                    // Regular file, pipe, char device, etc. — accepted.
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EBADF) => {
+                    // FD was closed between enumeration and readlink.
+                    // Harmless race — the descriptor is gone.
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Error::Validation(format!(
+                        "deny_unix_sockets: cannot classify fd {fd}: readlink: {e}"
+                    )));
+                }
+            }
+            continue;
+        }
+
+        if raw == libc::EBADF {
+            // FD was closed between enumeration and getsockopt.
+            continue;
+        }
+
+        // Unexpected error — fail closed.
+        return Err(Error::Validation(format!(
+            "deny_unix_sockets: cannot inspect fd {fd}: getsockopt: {errno}"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate that the deny_unix_sockets policy can be enforced on
+/// this platform and architecture.
+///
+/// Returns an error if seccomp is not supported (the creation-denial
+/// filter cannot be installed). The caller should check this before
+/// any irreversible restrictions.
+#[allow(dead_code)] // Callers wired in the next commit.
+pub(crate) fn validate_deny_unix_sockets_support() -> crate::Result<()> {
+    if !cfg!(seccomp_supported) {
+        return Err(Error::Validation(
+            "deny_unix_sockets requires seccomp (Linux x86_64 or aarch64)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that the calling process is single-threaded.
+///
+/// For the direct-apply path (`arapuca_apply`), the retained-resource
+/// scan and seccomp installation must not race concurrent descriptor
+/// mutations. This checks `/proc/self/task` and rejects if more than
+/// one thread is detected. Propagates enumeration errors.
+#[allow(dead_code)] // Callers wired in the next commit.
+pub(crate) fn validate_single_threaded() -> crate::Result<()> {
+    let task_dir = std::fs::read_dir("/proc/self/task").map_err(|e| {
+        Error::Validation(format!(
+            "deny_unix_sockets: cannot enumerate /proc/self/task: {e}"
+        ))
+    })?;
+
+    let count = task_dir.count();
+    if count > 1 {
+        return Err(Error::Validation(format!(
+            "deny_unix_sockets: direct apply requires single-threaded context \
+             ({count} threads detected)"
+        )));
+    }
+    if count == 0 {
+        return Err(Error::Validation(
+            "deny_unix_sockets: /proc/self/task is empty (unexpected)".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Apply the seccomp BPF filter to the current process.
 ///
 /// The filter restrictiveness depends on the profile:
@@ -1845,6 +2009,148 @@ mod tests {
         });
         assert!(!exited, "baseline: x32-tagged syscall should be killed");
         assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from x32 guard");
+    }
+
+    // ─── Retained-resource validation tests ─────────────────────
+    //
+    // All validation tests fork a child so the FD table scan is
+    // isolated from parallel tests that may hold AF_UNIX sockets.
+
+    /// Fork a child with a clean FD table, run `test_fn`, return
+    /// (exited, exit_code_or_signal). Closes all FDs ≥ 3 in the
+    /// child before calling `test_fn`, so parallel tests' sockets
+    /// don't pollute the validation scan.
+    fn run_in_clean_child(test_fn: fn()) -> (bool, i32) {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Close inherited FDs from parallel tests.
+            for fd in 3..1024 {
+                unsafe { libc::close(fd) };
+            }
+            test_fn();
+            unsafe { libc::_exit(0) };
+        }
+        let mut wstatus: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(pid, &mut wstatus, 0) };
+        assert!(ret > 0, "waitpid failed");
+        if libc::WIFEXITED(wstatus) {
+            (true, libc::WEXITSTATUS(wstatus))
+        } else {
+            (false, libc::WTERMSIG(wstatus))
+        }
+    }
+
+    #[test]
+    fn validate_no_retained_unix_resources_passes_clean() {
+        let (exited, code) = run_in_clean_child(|| match validate_no_retained_unix_resources() {
+            Ok(()) => unsafe { libc::_exit(42) },
+            Err(_) => unsafe { libc::_exit(1) },
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "clean child should pass validation");
+    }
+
+    #[test]
+    fn validate_rejects_inherited_unix_socket() {
+        let (exited, code) = run_in_clean_child(|| {
+            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                unsafe { libc::_exit(99) };
+            }
+            match validate_no_retained_unix_resources() {
+                Err(e) if e.to_string().contains("AF_UNIX") => {
+                    unsafe { libc::close(fd) };
+                    unsafe { libc::_exit(42) };
+                }
+                _ => {
+                    unsafe { libc::close(fd) };
+                    unsafe { libc::_exit(1) };
+                }
+            }
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "validation should reject AF_UNIX socket");
+    }
+
+    #[test]
+    fn validate_accepts_inet_socket() {
+        let (exited, code) = run_in_clean_child(|| {
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                unsafe { libc::_exit(99) };
+            }
+            match validate_no_retained_unix_resources() {
+                Ok(()) => {
+                    unsafe { libc::close(fd) };
+                    unsafe { libc::_exit(42) };
+                }
+                Err(_) => {
+                    unsafe { libc::close(fd) };
+                    unsafe { libc::_exit(1) };
+                }
+            }
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "AF_INET socket should be accepted");
+    }
+
+    #[test]
+    fn validate_accepts_pipes() {
+        let (exited, code) = run_in_clean_child(|| {
+            let mut fds = [0i32; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                unsafe { libc::_exit(99) };
+            }
+            match validate_no_retained_unix_resources() {
+                Ok(()) => unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                    libc::_exit(42);
+                },
+                Err(_) => unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                    libc::_exit(1);
+                },
+            }
+        });
+        assert!(exited, "child should exit normally");
+        assert_eq!(code, 42, "pipes should be accepted");
+    }
+
+    #[test]
+    fn validate_deny_support_passes_on_supported() {
+        // On the seccomp_supported cfg, this should succeed.
+        let result = validate_deny_unix_sockets_support();
+        if cfg!(seccomp_supported) {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn validate_single_threaded_passes() {
+        // Cargo test may use threads, so fork a child to get a
+        // guaranteed single-threaded context.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            match validate_single_threaded() {
+                Ok(()) => unsafe { libc::_exit(42) },
+                Err(_) => unsafe { libc::_exit(1) },
+            }
+        }
+        let mut wstatus: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(pid, &mut wstatus, 0) };
+        assert!(ret > 0, "waitpid failed");
+        assert!(libc::WIFEXITED(wstatus));
+        assert_eq!(
+            libc::WEXITSTATUS(wstatus),
+            42,
+            "single-threaded child should pass validation"
+        );
     }
 
     #[test]
