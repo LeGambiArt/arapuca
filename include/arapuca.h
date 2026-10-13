@@ -586,8 +586,25 @@ uint32_t arapuca_process_oom_count(const struct arapuca_ArapucaProcess *proc);
 void arapuca_process_cleanup(struct arapuca_ArapucaProcess *proc);
 
 /**
+ * Enable Unix socket denial (Linux x86_64/aarch64 process isolation only).
+ * Unsupported enabled requests fail at launch/application.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_deny_unix_sockets(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
  * Apply sandbox restrictions to the current process. Fail-closed.
  * Returns 0 on success, -1 on error.
+ *
+ * With Unix socket denial enabled, apply before untrusted execution in a
+ * single-threaded process with exclusive FD-table ownership. No signal
+ * handler may change descriptors during application. The caller must have
+ * torn down all usable pre-existing io_uring contexts/submission mappings,
+ * including descriptor-less registered rings and outstanding asynchronous
+ * work. FD scanning cannot establish their absence; use fresh-exec launch
+ * when these preconditions cannot be guaranteed.
  *
  * # Safety
  * `profile` must be a valid pointer.

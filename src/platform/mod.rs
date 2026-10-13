@@ -25,6 +25,8 @@ pub(crate) mod microvm_net;
 mod other;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
+#[cfg(target_os = "linux")]
+mod wrapper_exec;
 
 #[cfg(target_os = "windows")]
 pub use self::windows::Windows;

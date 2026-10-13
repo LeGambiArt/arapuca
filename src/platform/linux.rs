@@ -53,6 +53,7 @@ impl Linux {
 
 impl Sandbox for Linux {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
+        cfg.profile.validate_unix_socket_policy()?;
         // Validate task ID.
         crate::sanitize_task_id(&cfg.task_id)?;
 
@@ -112,12 +113,28 @@ impl Sandbox for Linux {
         // and filesystem paths are configured, wrap through it.
         let wrapper = Self::wrapper_path();
         let use_wrapper = wrapper.is_some();
+        let pinned_wrapper =
+            if cfg.profile.deny_unix_sockets && !crate::selfexec::selfexec_enabled() {
+                let path = wrapper.as_ref().ok_or_else(|| {
+                    Error::Validation("Unix socket denial requires a wrapper".into())
+                })?;
+                let pinned = super::wrapper_exec::PinnedWrapper::open(path)?;
+                pinned.check()?;
+                Some(pinned)
+            } else {
+                None
+            };
 
         if use_wrapper {
             let wrapper_path = wrapper.as_ref().unwrap();
             let mut wrapper_args = vec!["--".to_string(), actual_cmd];
             wrapper_args.extend(actual_args);
-            actual_cmd = wrapper_path.to_string_lossy().into_owned();
+            actual_cmd = pinned_wrapper
+                .as_ref()
+                .map(|p| p.path())
+                .unwrap_or_else(|| wrapper_path.clone())
+                .to_string_lossy()
+                .into_owned();
             actual_args = wrapper_args;
 
             let abi = crate::landlock::abi_version();
@@ -445,6 +462,10 @@ impl Sandbox for Linux {
         command.env_clear();
         for (k, v) in &env_vars {
             command.env(k, v);
+        }
+        let wrapper_exec_fd = pinned_wrapper.as_ref().map(|p| p.fd());
+        if let Some(fd) = wrapper_exec_fd {
+            command.env("ARAPUCA_WRAPPER_EXEC_FD", fd.to_string());
         }
 
         // Validate extra FDs before PTY allocation so that validation
@@ -938,6 +959,9 @@ impl Sandbox for Linux {
                 if !fds_to_inherit.is_empty() {
                     super::fd::remap_fds(&mut fds_to_inherit)?;
                 }
+                if let Some(fd) = wrapper_exec_fd {
+                    super::wrapper_exec::inherit_exec_fd(fd)?;
+                }
 
                 // PTY slave setup: acquire controlling terminal, then
                 // redirect stdio. TIOCSCTTY runs after setsid() which
@@ -1006,12 +1030,16 @@ impl Sandbox for Linux {
 
             #[cfg(seccomp_supported)]
             {
-                let seccomp = crate::seccomp::summary(&cfg.profile.seccomp_profile);
+                let seccomp = crate::seccomp::summary(
+                    &cfg.profile.seccomp_profile,
+                    cfg.profile.deny_unix_sockets,
+                );
                 ctx.emit(AuditEvent::SeccompPolicy {
                     timestamp: ctx.timestamp(),
                     tier1_kill_count: seccomp.tier1_kill_count,
                     tier2_eperm_count: seccomp.tier2_eperm_count,
                     socket_filter: seccomp.socket_filter,
+                    deny_unix_sockets: seccomp.deny_unix_sockets,
                     prctl_filter: seccomp.prctl_filter,
                     clone_ns_filter: seccomp.clone_ns_filter,
                     clone3_enosys: seccomp.clone3_enosys,

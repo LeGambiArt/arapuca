@@ -38,19 +38,19 @@ use crate::Error;
 #[cfg(target_arch = "x86_64")]
 mod x32 {
     /// `__X32_SYSCALL_BIT` — bit 30, set on all x32 ABI syscall numbers.
-    pub const SYSCALL_BIT: u32 = 0x4000_0000;
+    pub(super) const SYSCALL_BIT: u32 = 0x4000_0000;
 
     // BPF instruction constants (not re-exported by seccompiler).
-    pub const BPF_LD: u16 = 0x00;
-    pub const BPF_JMP: u16 = 0x05;
-    pub const BPF_RET: u16 = 0x06;
-    pub const BPF_W: u16 = 0x00;
-    pub const BPF_ABS: u16 = 0x20;
-    pub const BPF_JSET: u16 = 0x40;
-    pub const BPF_K: u16 = 0x00;
+    pub(super) const BPF_LD: u16 = 0x00;
+    pub(super) const BPF_JMP: u16 = 0x05;
+    pub(super) const BPF_RET: u16 = 0x06;
+    pub(super) const BPF_W: u16 = 0x00;
+    pub(super) const BPF_ABS: u16 = 0x20;
+    pub(super) const BPF_JSET: u16 = 0x40;
+    pub(super) const BPF_K: u16 = 0x00;
 
     /// Offset of the `nr` field in `struct seccomp_data`.
-    pub const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+    pub(super) const SECCOMP_DATA_NR_OFFSET: u32 = 0;
 }
 
 /// Build a raw BPF filter that kills the process on x32 syscall numbers.
@@ -129,7 +129,6 @@ fn build_x32_guard() -> Option<BpfProgram> {
 ///
 /// The caller must ensure no concurrent descriptor-table mutations
 /// (single-threaded context or exclusive ownership).
-#[allow(dead_code)] // Callers wired in the next commit.
 pub(crate) fn validate_no_retained_unix_resources() -> crate::Result<()> {
     let fd_dir = std::fs::read_dir("/proc/self/fd").map_err(|e| {
         Error::Validation(format!(
@@ -155,19 +154,30 @@ pub(crate) fn validate_no_retained_unix_resources() -> crate::Result<()> {
         })?;
 
         // Check if it's a socket and what domain it has.
-        let mut domain: libc::c_int = 0;
-        let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let ret = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_DOMAIN,
-                &mut domain as *mut _ as *mut libc::c_void,
-                &mut len,
-            )
+        let (ret, domain, len) = loop {
+            let mut domain: libc::c_int = 0;
+            let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: domain and len point to live, correctly sized values.
+            let ret = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_DOMAIN,
+                    &mut domain as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            if ret == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break (ret, domain, len);
+            }
         };
 
         if ret == 0 {
+            if len as usize != std::mem::size_of::<libc::c_int>() {
+                return Err(Error::Validation(format!(
+                    "invalid SO_DOMAIN size on fd {fd}"
+                )));
+            }
             // It's a socket — reject AF_UNIX.
             if domain == libc::AF_UNIX {
                 return Err(Error::Validation(format!(
@@ -196,22 +206,12 @@ pub(crate) fn validate_no_retained_unix_resources() -> crate::Result<()> {
                     }
                     // Regular file, pipe, char device, etc. — accepted.
                 }
-                Err(e) if e.raw_os_error() == Some(libc::EBADF) => {
-                    // FD was closed between enumeration and readlink.
-                    // Harmless race — the descriptor is gone.
-                    continue;
-                }
                 Err(e) => {
                     return Err(Error::Validation(format!(
                         "deny_unix_sockets: cannot classify fd {fd}: readlink: {e}"
                     )));
                 }
             }
-            continue;
-        }
-
-        if raw == libc::EBADF {
-            // FD was closed between enumeration and getsockopt.
             continue;
         }
 
@@ -224,29 +224,12 @@ pub(crate) fn validate_no_retained_unix_resources() -> crate::Result<()> {
     Ok(())
 }
 
-/// Validate that the deny_unix_sockets policy can be enforced on
-/// this platform and architecture.
-///
-/// Returns an error if seccomp is not supported (the creation-denial
-/// filter cannot be installed). The caller should check this before
-/// any irreversible restrictions.
-#[allow(dead_code)] // Callers wired in the next commit.
-pub(crate) fn validate_deny_unix_sockets_support() -> crate::Result<()> {
-    if !cfg!(seccomp_supported) {
-        return Err(Error::Validation(
-            "deny_unix_sockets requires seccomp (Linux x86_64 or aarch64)".into(),
-        ));
-    }
-    Ok(())
-}
-
 /// Validate that the calling process is single-threaded.
 ///
 /// For the direct-apply path (`arapuca_apply`), the retained-resource
 /// scan and seccomp installation must not race concurrent descriptor
 /// mutations. This checks `/proc/self/task` and rejects if more than
 /// one thread is detected. Propagates enumeration errors.
-#[allow(dead_code)] // Callers wired in the next commit.
 pub(crate) fn validate_single_threaded() -> crate::Result<()> {
     let task_dir = std::fs::read_dir("/proc/self/task").map_err(|e| {
         Error::Validation(format!(
@@ -254,7 +237,11 @@ pub(crate) fn validate_single_threaded() -> crate::Result<()> {
         ))
     })?;
 
-    let count = task_dir.count();
+    let mut count = 0;
+    for entry in task_dir {
+        entry.map_err(|e| Error::Validation(format!("cannot inspect /proc/self/task: {e}")))?;
+        count += 1;
+    }
     if count > 1 {
         return Err(Error::Validation(format!(
             "deny_unix_sockets: direct apply requires single-threaded context \
@@ -281,20 +268,25 @@ pub(crate) fn validate_single_threaded() -> crate::Result<()> {
 /// After this call, the process is restricted to allowed syscalls. The
 /// filter is inherited across `fork()` and `execve()`.
 ///
+/// `deny_unix_sockets` blocks AF_UNIX socket/socketpair creation. This
+/// low-level filter installer does not inspect retained descriptors or
+/// asynchronous contexts; launch/direct-apply entry points validate those
+/// resources before installing the filters.
+///
 /// # Errors
 ///
 /// Returns an error if filter construction or installation fails.
 /// This is fail-closed — an error means the process is NOT filtered.
 #[must_use = "seccomp errors must be handled — the process may be unfiltered"]
-pub fn apply(profile: &crate::SeccompProfile) -> crate::Result<()> {
+pub fn apply(profile: &crate::SeccompProfile, deny_unix_sockets: bool) -> crate::Result<()> {
     match profile {
         crate::SeccompProfile::Strict => {
-            let filter = build_filter()?;
+            let filter = build_filter(deny_unix_sockets)?;
             seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
             log::info!("seccomp: strict filter applied");
         }
         crate::SeccompProfile::Baseline => {
-            let filter = build_baseline_filter()?;
+            let filter = build_baseline_filter(deny_unix_sockets)?;
             seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
             log::info!("seccomp: baseline filter applied");
         }
@@ -314,11 +306,28 @@ pub fn apply(profile: &crate::SeccompProfile) -> crate::Result<()> {
 }
 
 /// Build the seccomp BPF filter program.
+fn add_unix_socket_rules(rules: &mut HashMap<i64, Vec<SeccompRule>>) -> crate::Result<()> {
+    for syscall in [libc::SYS_socket, libc::SYS_socketpair] {
+        let condition = SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_UNIX as u64,
+        )
+        .map_err(|e| Error::Seccomp(format!("Unix socket condition: {e}")))?;
+        let rule = SeccompRule::new(vec![condition])
+            .map_err(|e| Error::Seccomp(format!("Unix socket rule: {e}")))?;
+        rules.entry(syscall).or_default().push(rule);
+    }
+    Ok(())
+}
+
+/// Build the seccomp BPF filter program.
 ///
 /// The filter uses a default-allow policy with explicit deny rules.
 /// This matches the Go implementation's approach: block dangerous
 /// syscalls, allow everything else.
-fn build_filter() -> crate::Result<BpfProgram> {
+fn build_filter(deny_unix_sockets: bool) -> crate::Result<BpfProgram> {
     let arch = target_arch()?;
 
     // Collect all rules: syscall -> (action, conditions).
@@ -389,7 +398,13 @@ fn build_filter() -> crate::Result<BpfProgram> {
     ])
     .map_err(|e| Error::Seccomp(format!("socket AF_INET6 rule: {e}")))?;
 
-    eperm_rules.insert(libc::SYS_socket, vec![socket_inet, socket_inet6]);
+    eperm_rules
+        .entry(libc::SYS_socket)
+        .or_default()
+        .extend([socket_inet, socket_inet6]);
+    if deny_unix_sockets {
+        add_unix_socket_rules(&mut eperm_rules)?;
+    }
 
     // prctl argument filtering: block all PR_SET_PDEATHSIG (any signal
     // value) and all non-zero PR_SET_DUMPABLE (including SUID_DUMP_ROOT=2).
@@ -671,6 +686,7 @@ pub(crate) struct SeccompSummary {
     /// flags check) — those are reported as separate bool flags below.
     pub tier2_eperm_count: usize,
     pub socket_filter: bool,
+    pub deny_unix_sockets: bool,
     pub prctl_filter: bool,
     pub clone_ns_filter: bool,
     pub clone3_enosys: bool,
@@ -679,12 +695,13 @@ pub(crate) struct SeccompSummary {
     pub kill_filter: bool,
 }
 
-pub(crate) fn summary(profile: &crate::SeccompProfile) -> SeccompSummary {
+pub(crate) fn summary(profile: &crate::SeccompProfile, deny_unix_sockets: bool) -> SeccompSummary {
     match profile {
         crate::SeccompProfile::Strict => SeccompSummary {
             tier1_kill_count: tier1_kill_syscalls().len(),
             tier2_eperm_count: tier2_eperm_syscalls().len(),
             socket_filter: true,
+            deny_unix_sockets,
             prctl_filter: true,
             clone_ns_filter: true,
             clone3_enosys: true,
@@ -696,6 +713,7 @@ pub(crate) fn summary(profile: &crate::SeccompProfile) -> SeccompSummary {
             tier1_kill_count: baseline_kill_syscalls().len(),
             tier2_eperm_count: 2, // tkill + perf_event_open
             socket_filter: false,
+            deny_unix_sockets,
             prctl_filter: true,
             clone_ns_filter: true,
             clone3_enosys: true,
@@ -764,7 +782,7 @@ fn baseline_kill_syscalls() -> Vec<i64> {
 /// Blocks escape-critical syscalls unconditionally, plus clone() with
 /// namespace flags and clone3 (returns ENOSYS to force fallback to
 /// clone where flags can be inspected).
-fn build_baseline_filter() -> crate::Result<BpfProgram> {
+fn build_baseline_filter(deny_unix_sockets: bool) -> crate::Result<BpfProgram> {
     let arch = target_arch()?;
 
     let mut deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
@@ -887,6 +905,9 @@ fn build_baseline_filter() -> crate::Result<BpfProgram> {
     // Consolidated EPERM filter for all argument-filtered rules.
     // A single stacked filter reduces BPF evaluation overhead.
     let mut eperm_rules: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    if deny_unix_sockets {
+        add_unix_socket_rules(&mut eperm_rules)?;
+    }
 
     // prctl(PR_SET_PDEATHSIG, *) and prctl(PR_SET_DUMPABLE, non-zero)
     let baseline_prctl_pdeathsig = SeccompRule::new(vec![
@@ -1425,7 +1446,13 @@ mod tests {
     fn filter_builds() {
         // Verify the filter compiles without error.
         // We don't apply it here because that would restrict this test process.
-        assert!(build_filter().is_ok());
+        let (exited, code) = run_in_clean_child(|| {
+            if build_filter(false).is_ok() {
+                unsafe { libc::_exit(42) };
+            }
+        });
+        assert!(exited);
+        assert_eq!(code, 42);
     }
 
     /// Fork a child, apply the seccomp filter, run `test_fn`, and
@@ -1437,7 +1464,7 @@ mod tests {
 
         if pid == 0 {
             // Child: apply filter and run the test.
-            if let Err(e) = apply(&crate::SeccompProfile::Strict) {
+            if let Err(e) = apply(&crate::SeccompProfile::Strict, false) {
                 eprintln!("seccomp apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -1908,7 +1935,7 @@ mod tests {
         assert!(pid >= 0, "fork failed");
 
         if pid == 0 {
-            if let Err(e) = apply(&crate::SeccompProfile::Baseline) {
+            if let Err(e) = apply(&crate::SeccompProfile::Baseline, false) {
                 eprintln!("seccomp baseline apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -2020,13 +2047,13 @@ mod tests {
     /// (exited, exit_code_or_signal). Closes all FDs ≥ 3 in the
     /// child before calling `test_fn`, so parallel tests' sockets
     /// don't pollute the validation scan.
-    fn run_in_clean_child(test_fn: fn()) -> (bool, i32) {
+    fn run_in_clean_child(test_fn: impl FnOnce()) -> (bool, i32) {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             // Close inherited FDs from parallel tests.
-            for fd in 3..1024 {
-                unsafe { libc::close(fd) };
+            if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } != 0 {
+                unsafe { libc::_exit(99) };
             }
             test_fn();
             unsafe { libc::_exit(0) };
@@ -2122,7 +2149,11 @@ mod tests {
     #[test]
     fn validate_deny_support_passes_on_supported() {
         // On the seccomp_supported cfg, this should succeed.
-        let result = validate_deny_unix_sockets_support();
+        let result = crate::Profile {
+            deny_unix_sockets: true,
+            ..Default::default()
+        }
+        .validate_unix_socket_policy();
         if cfg!(seccomp_supported) {
             assert!(result.is_ok());
         } else {
@@ -2151,6 +2182,166 @@ mod tests {
             42,
             "single-threaded child should pass validation"
         );
+    }
+
+    #[test]
+    fn unix_creation_policy_covers_both_profiles_and_type_flags() {
+        for profile in [
+            crate::SeccompProfile::Strict,
+            crate::SeccompProfile::Baseline,
+        ] {
+            for deny in [false, true] {
+                let (exited, code) = run_in_clean_child(|| {
+                    if apply(&profile, deny).is_err() {
+                        unsafe { libc::_exit(99) };
+                    }
+                    for ty in [libc::SOCK_STREAM, libc::SOCK_DGRAM] {
+                        for flags in [
+                            0,
+                            libc::SOCK_CLOEXEC,
+                            libc::SOCK_NONBLOCK,
+                            libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                        ] {
+                            let fd = unsafe { libc::socket(libc::AF_UNIX, ty | flags, 0) };
+                            if deny {
+                                if fd != -1
+                                    || std::io::Error::last_os_error().raw_os_error()
+                                        != Some(libc::EPERM)
+                                {
+                                    unsafe { libc::_exit(1) };
+                                }
+                            } else if fd < 0 {
+                                unsafe { libc::_exit(2) };
+                            } else {
+                                unsafe { libc::close(fd) };
+                            }
+                            let mut sv = [-1; 2];
+                            let ret = unsafe {
+                                libc::socketpair(libc::AF_UNIX, ty | flags, 0, sv.as_mut_ptr())
+                            };
+                            if deny {
+                                if ret != -1
+                                    || std::io::Error::last_os_error().raw_os_error()
+                                        != Some(libc::EPERM)
+                                {
+                                    unsafe { libc::_exit(3) };
+                                }
+                            } else if ret != 0 {
+                                unsafe { libc::_exit(4) };
+                            } else {
+                                unsafe {
+                                    libc::close(sv[0]);
+                                    libc::close(sv[1]);
+                                }
+                            }
+                        }
+                    }
+                    for domain in [libc::AF_INET, libc::AF_INET6] {
+                        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+                        if profile == crate::SeccompProfile::Strict {
+                            if fd != -1
+                                || std::io::Error::last_os_error().raw_os_error()
+                                    != Some(libc::EPERM)
+                            {
+                                unsafe { libc::_exit(5) };
+                            }
+                        } else if fd < 0 {
+                            unsafe { libc::_exit(6) };
+                        } else {
+                            unsafe { libc::close(fd) };
+                        }
+                    }
+                    unsafe { libc::_exit(42) };
+                });
+                assert!(exited, "{profile:?}, deny={deny}, signal={code}");
+                assert_eq!(code, 42, "{profile:?}, deny={deny}");
+            }
+        }
+    }
+
+    #[test]
+    fn retained_socket_scan_rejects_stdio_and_high_connected_descriptors() {
+        for target in [0, 1, 2, 4096] {
+            let (exited, code) = run_in_clean_child(|| {
+                let mut sv = [-1; 2];
+                if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) }
+                    != 0
+                    || unsafe { libc::dup2(sv[0], target) } != target
+                {
+                    unsafe { libc::_exit(99) };
+                }
+                unsafe {
+                    libc::close(sv[0]);
+                    libc::close(sv[1]);
+                }
+                match validate_no_retained_unix_resources() {
+                    Err(e) if e.to_string().contains(&format!("fd {target}")) => unsafe {
+                        libc::_exit(42)
+                    },
+                    _ => unsafe { libc::_exit(1) },
+                }
+            });
+            assert!(exited);
+            assert_eq!(code, 42, "target {target}");
+        }
+    }
+
+    #[test]
+    fn inspection_failure_is_not_treated_as_a_non_socket() {
+        let (exited, code) = run_in_clean_child(|| {
+            let deny = SeccompFilter::new(
+                [(libc::SYS_getsockopt, vec![])].into_iter().collect(),
+                SeccompAction::Allow,
+                SeccompAction::Errno(libc::EPERM as u32),
+                target_arch().unwrap(),
+            )
+            .unwrap();
+            let bpf: BpfProgram = deny.try_into().unwrap();
+            seccompiler::apply_filter(&bpf).unwrap();
+            match validate_no_retained_unix_resources() {
+                Err(e) if e.to_string().contains("getsockopt") => unsafe { libc::_exit(42) },
+                _ => unsafe { libc::_exit(1) },
+            }
+        });
+        assert!(exited);
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn unavailable_proc_enumeration_fails_closed() {
+        let (exited, code) = run_in_clean_child(|| {
+            if crate::landlock::apply(&crate::Profile::default(), None).is_err() {
+                unsafe { libc::_exit(99) };
+            }
+            match validate_no_retained_unix_resources() {
+                Err(e) if e.to_string().contains("enumerate") => unsafe { libc::_exit(42) },
+                _ => unsafe { libc::_exit(1) },
+            }
+        });
+        assert!(exited);
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn direct_validation_detects_existing_threads() {
+        let (exited, code) = run_in_clean_child(|| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                stop_rx.recv().unwrap();
+            });
+            ready_rx.recv().unwrap();
+            let result = validate_single_threaded();
+            stop_tx.send(()).unwrap();
+            thread.join().unwrap();
+            if result.is_err() {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited);
+        assert_eq!(code, 42);
     }
 
     #[test]

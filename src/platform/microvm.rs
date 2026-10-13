@@ -60,6 +60,11 @@ impl MicroVm {
 
 impl Sandbox for MicroVm {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
+        if cfg.profile.deny_unix_sockets {
+            return Err(crate::Error::Validation(
+                "Unix socket denial is unavailable for MicroVm".into(),
+            ));
+        }
         let vm_cfg = match &cfg.profile.isolation {
             Isolation::MicroVm(c) => c,
             _ => {

@@ -373,6 +373,10 @@ pub fn wrapper_env(profile: &crate::Profile) -> crate::Result<Vec<(String, Strin
         "ARAPUCA_ALLOW_EXEC".into(),
         if profile.allow_exec { "1" } else { "0" }.into(),
     ));
+    env.push((
+        "ARAPUCA_DENY_UNIX_SOCKETS".into(),
+        if profile.deny_unix_sockets { "1" } else { "0" }.into(),
+    ));
     if profile.seccomp_debug {
         env.push(("ARAPUCA_SECCOMP_DEBUG".into(), "1".into()));
     }

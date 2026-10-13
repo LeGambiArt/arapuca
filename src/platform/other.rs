@@ -20,6 +20,7 @@ pub struct Other;
 
 impl Sandbox for Other {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
+        cfg.profile.validate_unix_socket_policy()?;
         if cfg.tty {
             return Err(crate::Error::Validation(
                 "tty mode is not supported on this platform".into(),

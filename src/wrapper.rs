@@ -6,6 +6,55 @@
 
 use std::path::PathBuf;
 
+/// Exact standalone-wrapper enforcement contract, independent of serde.
+pub const UNIX_SOCKET_CAPABILITY: &str = "arapuca unix-socket-denial-v1\n";
+
+/// Parse the trusted wrapper policy transport, rejecting malformed values.
+pub fn deny_unix_sockets_from_env() -> crate::Result<bool> {
+    match std::env::var("ARAPUCA_DENY_UNIX_SOCKETS") {
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v == "0" => Ok(false),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        _ => Err(crate::Error::Validation(
+            "invalid ARAPUCA_DENY_UNIX_SOCKETS".into(),
+        )),
+    }
+}
+
+/// Validate retained resources before any internal helper socketpairs exist.
+pub fn validate_unix_socket_policy(
+    profile: &crate::Profile,
+    direct_apply: bool,
+) -> crate::Result<()> {
+    profile.validate_unix_socket_policy()?;
+    #[cfg(seccomp_supported)]
+    if profile.deny_unix_sockets {
+        if direct_apply {
+            crate::seccomp::validate_single_threaded()?;
+        }
+        crate::seccomp::validate_no_retained_unix_resources()?;
+    }
+    let _ = direct_apply;
+    Ok(())
+}
+
+/// Release the pinned wrapper descriptor after the trampoline exec.
+#[cfg(target_os = "linux")]
+pub fn close_wrapper_exec_fd() -> crate::Result<()> {
+    if let Some(v) = std::env::var_os("ARAPUCA_WRAPPER_EXEC_FD") {
+        let fd = v
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+            .filter(|&fd| fd >= 64)
+            .ok_or_else(|| crate::Error::Validation("invalid wrapper exec FD".into()))?;
+        // SAFETY: the launcher reserves this descriptor for the executable.
+        if unsafe { libc::close(fd) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
 /// Simple PATH lookup for a command name.
 pub fn which(cmd: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
