@@ -21,6 +21,91 @@ use seccompiler::{
 
 use crate::Error;
 
+// ─── x32 ABI guard (x86_64 only) ─────────────────────────────────
+//
+// On x86_64, the x32 ABI shares AUDIT_ARCH_X86_64 but sets bit 30
+// (__X32_SYSCALL_BIT = 0x40000000) in the syscall number. The
+// seccompiler dependency validates the audit architecture but compares
+// native syscall numbers exactly — x32-tagged numbers fall through to
+// the default Allow action, bypassing all deny rules.
+//
+// This guard installs a stacked BPF filter that kills the process if
+// any syscall number has the x32 bit set. It uses raw BPF because
+// seccompiler's condition API operates on syscall arguments, not on
+// the syscall number field itself.
+
+// x32 guard constants — only needed on x86_64.
+#[cfg(target_arch = "x86_64")]
+mod x32 {
+    /// `__X32_SYSCALL_BIT` — bit 30, set on all x32 ABI syscall numbers.
+    pub const SYSCALL_BIT: u32 = 0x4000_0000;
+
+    // BPF instruction constants (not re-exported by seccompiler).
+    pub const BPF_LD: u16 = 0x00;
+    pub const BPF_JMP: u16 = 0x05;
+    pub const BPF_RET: u16 = 0x06;
+    pub const BPF_W: u16 = 0x00;
+    pub const BPF_ABS: u16 = 0x20;
+    pub const BPF_JSET: u16 = 0x40;
+    pub const BPF_K: u16 = 0x00;
+
+    /// Offset of the `nr` field in `struct seccomp_data`.
+    pub const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+}
+
+/// Build a raw BPF filter that kills the process on x32 syscall numbers.
+///
+/// On x86_64, returns a 4-instruction program:
+///   1. Load seccomp_data.nr
+///   2. Test if __X32_SYSCALL_BIT is set (JSET)
+///   3. If set → KILL_PROCESS
+///   4. Otherwise → ALLOW
+///
+/// On aarch64 (no x32 ABI), returns `None`.
+fn build_x32_guard() -> Option<BpfProgram> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use seccompiler::sock_filter;
+        use x32::*;
+        let prog: BpfProgram = vec![
+            // Load seccomp_data.nr (32-bit word at offset 0).
+            sock_filter {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_DATA_NR_OFFSET,
+            },
+            // Test: nr & __X32_SYSCALL_BIT != 0?
+            // jt=0 → next instruction (kill), jf=1 → skip to allow.
+            sock_filter {
+                code: BPF_JMP | BPF_JSET | BPF_K,
+                jt: 0,
+                jf: 1,
+                k: SYSCALL_BIT,
+            },
+            // __X32_SYSCALL_BIT is set → kill.
+            sock_filter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_KILL_PROCESS,
+            },
+            // __X32_SYSCALL_BIT is not set → allow (fall through to other filters).
+            sock_filter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        Some(prog)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        None
+    }
+}
+
 /// Apply the seccomp BPF filter to the current process.
 ///
 /// The filter restrictiveness depends on the profile:
@@ -50,6 +135,17 @@ pub fn apply(profile: &crate::SeccompProfile) -> crate::Result<()> {
             log::info!("seccomp: baseline filter applied");
         }
     }
+
+    // Install the x32 ABI guard last (checked first by kernel due to
+    // filter stacking). Kills the process if any syscall number has
+    // __X32_SYSCALL_BIT set, preventing x32-tagged numbers from
+    // reaching native deny rules that would otherwise miss them.
+    if let Some(guard) = build_x32_guard() {
+        seccompiler::apply_filter(&guard)
+            .map_err(|e| Error::Seccomp(format!("install x32 guard: {e}")))?;
+        log::info!("seccomp: x32 ABI guard installed");
+    }
+
     Ok(())
 }
 
@@ -1698,6 +1794,57 @@ mod tests {
         });
         assert!(exited, "io_uring_setup should return ENOSYS, not kill");
         assert_eq!(code, 42, "baseline: io_uring_setup should return ENOSYS");
+    }
+
+    #[test]
+    fn x32_guard_builds() {
+        let guard = build_x32_guard();
+        #[cfg(target_arch = "x86_64")]
+        {
+            let prog = guard.expect("x32 guard should exist on x86_64");
+            assert_eq!(prog.len(), 4, "x32 guard should be 4 BPF instructions");
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        assert!(guard.is_none(), "x32 guard should be None on non-x86_64");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_tagged_syscall_kills() {
+        // A syscall number with __X32_SYSCALL_BIT set should be killed
+        // by the x32 guard, even if the native number is allowed.
+        // Use SYS_getpid (native 39) ORed with 0x40000000.
+        let (exited, sig) = run_in_filtered_child(|| unsafe {
+            libc::syscall(0x4000_0000i64 | libc::SYS_getpid);
+        });
+        assert!(!exited, "x32-tagged syscall should be killed");
+        assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from x32 guard");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_guard_preserves_native_getpid() {
+        // Native getpid (no x32 bit) must still work after the guard.
+        let (exited, code) = run_in_filtered_child(|| {
+            let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+            if pid > 0 {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        });
+        assert!(exited, "native getpid should not be killed");
+        assert_eq!(code, 42, "native getpid should succeed");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_guard_baseline_kills() {
+        // x32-tagged syscalls should also be killed in baseline profile.
+        let (exited, sig) = run_in_baseline_child(|| unsafe {
+            libc::syscall(0x4000_0000i64 | libc::SYS_getpid);
+        });
+        assert!(!exited, "baseline: x32-tagged syscall should be killed");
+        assert_eq!(sig, libc::SIGSYS, "expected SIGSYS from x32 guard");
     }
 
     #[test]
