@@ -9,7 +9,7 @@ use std::path::Path;
 
 use landlock::{
     ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
-    RulesetStatus, make_bitflags, path_beneath_rules,
+    RulesetStatus, Scope, make_bitflags, path_beneath_rules,
 };
 
 use crate::{Error, Profile};
@@ -71,9 +71,15 @@ pub fn apply(profile: &Profile, target_binary: Option<&Path>) -> crate::Result<(
         AccessFs::from_all(abi) & !make_bitflags!(AccessFs::{ Execute })
     };
 
-    let mut ruleset = Ruleset::default()
+    let mut builder = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
-        .map_err(|e| Error::Landlock(format!("handle access: {e}")))?
+        .map_err(|e| Error::Landlock(format!("handle access: {e}")))?;
+    if profile.deny_unix_sockets {
+        builder = builder
+            .scope(Scope::AbstractUnixSocket)
+            .map_err(|e| Error::Landlock(format!("scope AbstractUnixSocket: {e}")))?;
+    }
+    let mut ruleset = builder
         .create()
         .map_err(|e| Error::Landlock(format!("create ruleset: {e}")))?;
 
@@ -125,13 +131,19 @@ pub fn apply(profile: &Profile, target_binary: Option<&Path>) -> crate::Result<(
         }
         RulesetStatus::PartiallyEnforced => {
             let abi = abi_version();
-            let missing: &[&str] = match abi {
-                0..=1 => &["Refer", "Truncate", "IOCTL_DEV", "SCOPE_UNIX"],
-                2 => &["Truncate", "IOCTL_DEV", "SCOPE_UNIX"],
-                3 => &["IOCTL_DEV", "SCOPE_UNIX"],
-                4 => &["SCOPE_UNIX"],
-                _ => &[],
-            };
+            let mut missing = Vec::new();
+            if abi <= 1 {
+                missing.push("Refer");
+            }
+            if abi <= 2 {
+                missing.push("Truncate");
+            }
+            if abi <= 3 {
+                missing.push("IOCTL_DEV");
+            }
+            if profile.deny_unix_sockets && abi <= 5 {
+                missing.push("SCOPE_ABSTRACT_UNIX");
+            }
             log::info!("landlock: applied (PartiallyEnforced, ABI {abi})");
             if !missing.is_empty() {
                 log::warn!("landlock: ABI {abi} — not enforced: {}", missing.join(", "));
