@@ -2263,6 +2263,24 @@ mod tests {
     fn retained_socket_scan_rejects_stdio_and_high_connected_descriptors() {
         for target in [0, 1, 2, 4096] {
             let (exited, code) = run_in_clean_child(|| {
+                // Raise RLIMIT_NOFILE soft limit if needed to cover the
+                // target fd; build environments like Koji may cap it at 1024.
+                let needed = (target + 1) as libc::rlim_t;
+                let mut rlim = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 {
+                    unsafe { libc::_exit(77) };
+                }
+                if rlim.rlim_cur < needed {
+                    if rlim.rlim_max < needed {
+                        unsafe { libc::_exit(77) };
+                    }
+                    rlim.rlim_cur = needed;
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) };
+                }
+
                 let mut sv = [-1; 2];
                 if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) }
                     != 0
@@ -2282,6 +2300,10 @@ mod tests {
                 }
             });
             assert!(exited);
+            // 77 = hard limit too low for this fd, skip.
+            if code == 77 {
+                continue;
+            }
             assert_eq!(code, 42, "target {target}");
         }
     }
