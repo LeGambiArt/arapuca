@@ -2040,7 +2040,7 @@ mod tests {
 
     // ─── Retained-resource validation tests ─────────────────────
     //
-    // All validation tests fork a child so the FD table scan is
+    // FD validation tests fork a child so the FD table scan is
     // isolated from parallel tests that may hold AF_UNIX sockets.
 
     /// Fork a child with a clean FD table, run `test_fn`, return
@@ -2346,24 +2346,25 @@ mod tests {
 
     #[test]
     fn direct_validation_detects_existing_threads() {
-        let (exited, code) = run_in_clean_child(|| {
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-            let thread = std::thread::spawn(move || {
-                ready_tx.send(()).unwrap();
-                stop_rx.recv().unwrap();
-            });
-            ready_rx.recv().unwrap();
-            let result = validate_single_threaded();
-            stop_tx.send(()).unwrap();
-            thread.join().unwrap();
-            if result.is_err() {
-                unsafe { libc::_exit(42) };
-            }
-            unsafe { libc::_exit(1) };
+        // No FD isolation is needed for a thread-count check. Spawning a
+        // Rust thread after forking the test runner can deadlock on
+        // runtime locks inherited from other threads.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            stop_rx.recv().unwrap();
         });
-        assert!(exited);
-        assert_eq!(code, 42);
+        ready_rx.recv().unwrap();
+        let result = validate_single_threaded();
+        stop_tx.send(()).unwrap();
+        thread.join().unwrap();
+        let error = result.expect_err("live concurrent threads must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("requires single-threaded context")
+        );
     }
 
     #[test]
