@@ -110,6 +110,12 @@ preserved.
     CGNAT, link-local, and cloud metadata addresses are rejected to
     prevent DNS rebinding SSRF). Linux only.
 
+**-\-allow-xpc** *name*
+:   Allow exact Mach service *name* lookup for XPC. Repeatable; names are
+    matched exactly, wildcards are not accepted, and names beginning with a
+    hyphen are rejected (so a mistyped flag cannot be consumed as the name).
+    macOS only.
+
 **-\-allow-network-listeners**
 :   Allow TCP bind and inbound connections. Off by default. On Linux this
     enables a network namespace with loopback up and baseline seccomp; the
