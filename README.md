@@ -65,7 +65,7 @@ be bypassed from userspace.
   allows for filesystem, exec, and Unix domain sockets. Three network
   modes: allowed (baseline), proxy-only (when a CONNECT proxy is
   configured — blocks all TCP, allows only UDS to proxy), and denied
-  (strict)
+  (strict). Additional exact Mach service lookups are explicit opt-ins.
 - **Path validation** — strict character allowlist prevents Seatbelt
   profile injection attacks
 - **Memory monitor** — best-effort RSS polling (500ms) with SIGKILL
