@@ -242,6 +242,11 @@ pub struct Profile {
     /// the invoking user can. Enable only for trusted tools that need
     /// Keychain-backed credentials.
     pub allow_keychain: bool,
+    /// Additional exact macOS Mach service names allowed for XPC lookup.
+    ///
+    /// Empty by default. Each entry grants only `mach-lookup` for that exact
+    /// global service name; no wildcard matching is supported.
+    pub mach_lookup_services: Vec<String>,
     /// Allow the process to bind and accept TCP connections.
     ///
     /// Off by default. Seatbelt's network address filters do not provide a
@@ -254,6 +259,25 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Validate exact Mach service names used for macOS XPC lookup grants.
+    pub fn validate_mach_lookup_services(&self) -> crate::Result<()> {
+        for service in &self.mach_lookup_services {
+            let valid_chars = service.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ' ' | '(' | ')')
+            });
+            if service.is_empty()
+                || service.len() > 255
+                || service.trim() != service
+                || !valid_chars
+            {
+                return Err(crate::Error::Validation(format!(
+                    "invalid Mach service name {service:?}; expected 1-255 ASCII letters, digits, dots, underscores, hyphens, spaces, or parentheses"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate availability of an explicitly requested Unix socket policy.
     pub fn validate_unix_socket_policy(&self) -> crate::Result<()> {
         if self.deny_unix_sockets
@@ -287,6 +311,18 @@ mod unix_policy_tests {
             write_files: vec![],
         });
         assert!(profile.validate_unix_socket_policy().is_err());
+    }
+
+    #[test]
+    fn mach_lookup_services_are_exact_safe_names() {
+        let mut profile = Profile::default();
+        profile.mach_lookup_services = vec!["mul-xpc (Apple)_OpenStep".into()];
+        assert!(profile.validate_mach_lookup_services().is_ok());
+
+        profile.mach_lookup_services = vec!["service\") (allow default) (deny nothing \"".into()];
+        assert!(profile.validate_mach_lookup_services().is_err());
+        profile.mach_lookup_services = vec!["com.apple.*".into()];
+        assert!(profile.validate_mach_lookup_services().is_err());
     }
 }
 

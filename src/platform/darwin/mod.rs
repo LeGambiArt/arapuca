@@ -161,6 +161,7 @@ impl Darwin {
 impl Sandbox for Darwin {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
         cfg.profile.validate_unix_socket_policy()?;
+        cfg.profile.validate_mach_lookup_services()?;
         // Validate task ID and work directory.
         crate::sanitize_task_id(&cfg.task_id)?;
         crate::validate_work_dir(
@@ -230,15 +231,18 @@ impl Sandbox for Darwin {
             } else {
                 "network=denied"
             };
-            // Record Keychain access too: --allow-keychain widens the
-            // sandbox (extra Mach services and Keychain file reads), so
-            // it must leave an audit trail alongside the network mode.
+            // Record special macOS capabilities too: these grant additional
+            // Mach lookups (and Keychain file reads), so they must leave an
+            // audit trail alongside the network mode.
             let keychain_detail = if cfg.profile.allow_keychain {
                 "keychain=allowed"
             } else {
                 "keychain=denied"
             };
-            let seatbelt_detail = format!("{network_detail},{keychain_detail}");
+            let seatbelt_detail = format!(
+                "{network_detail},{keychain_detail},mach-lookup-services={}",
+                cfg.profile.mach_lookup_services.len()
+            );
             ctx.emit(AuditEvent::LayerApplied {
                 timestamp: ctx.timestamp(),
                 layer: SandboxLayer::Seatbelt,
@@ -380,6 +384,7 @@ impl Sandbox for Darwin {
             llm_socket,
             allow_network,
             allow_keychain: cfg.profile.allow_keychain,
+            mach_lookup_services: cfg.profile.mach_lookup_services.clone(),
             allow_network_listeners: cfg.profile.allow_network_listeners,
             tty: cfg.tty,
         };
