@@ -83,6 +83,23 @@ fn seatbelt_echo_stdout() {
     assert_eq!(stdout.trim(), "hello");
 }
 
+/// An additional XPC service compiles into a valid Seatbelt profile.
+#[test]
+fn seatbelt_additional_xpc_service_launches() {
+    let mut cfg = base_config("darwin-xpc-service");
+    cfg.profile.mach_lookup_services = vec!["mul-xpc (Apple)_OpenStep".into()];
+
+    let sb = new().unwrap();
+    let mut proc = sb.launch(&cfg, "/usr/bin/true", &[]).unwrap();
+    let status = proc.wait().unwrap();
+    proc.cleanup();
+
+    assert!(
+        status.success(),
+        "XPC service profile should launch /usr/bin/true"
+    );
+}
+
 /// stdin→stdout relay via /bin/cat through sandbox-exec.
 /// Proves bidirectional pipe FD inheritance survives the wrapper.
 #[test]

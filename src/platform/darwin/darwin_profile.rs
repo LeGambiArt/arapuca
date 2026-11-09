@@ -40,6 +40,8 @@ pub struct ProfileData {
     /// Keychain reads fail silently and Keychain-backed authentication
     /// reports "not logged in".
     pub allow_keychain: bool,
+    /// Exact global Mach service names allowed for XPC lookup.
+    pub mach_lookup_services: Vec<String>,
     /// Allow TCP listeners. macOS Seatbelt cannot strictly scope the bind
     /// permission to loopback, so this is intended only for trusted programs.
     pub allow_network_listeners: bool,
@@ -428,6 +430,12 @@ pub fn generate_profile(dir: &Path, data: &ProfileData) -> crate::Result<std::pa
         "(allow mach-lookup (global-name \"com.apple.system.notification_center\"))"
     )
     .unwrap();
+    if !data.mach_lookup_services.is_empty() {
+        writeln!(profile, "; Additional XPC Mach services (--allow-xpc)").unwrap();
+        for service in &data.mach_lookup_services {
+            writeln!(profile, "(allow mach-lookup (global-name \"{service}\"))").unwrap();
+        }
+    }
 
     if data.allow_network {
         // Apple system-network Mach services (from system.sb).
@@ -614,6 +622,7 @@ mod tests {
             llm_socket: Some("/tmp/sock/llm.sock".into()),
             allow_network: false,
             allow_keychain: false,
+            mach_lookup_services: vec![],
             allow_network_listeners: false,
             tty: false,
         };
@@ -702,6 +711,41 @@ mod tests {
     }
 
     #[test]
+    fn additional_mach_lookup_services_are_opt_in() {
+        let off_dir = std::env::temp_dir().join("arapuca-test-mach-services-off");
+        let on_dir = std::env::temp_dir().join("arapuca-test-mach-services-on");
+        let _ = std::fs::create_dir_all(&off_dir);
+        let _ = std::fs::create_dir_all(&on_dir);
+
+        let base = ProfileData {
+            read_paths: vec!["/home/user/src".into()],
+            write_paths: vec![],
+            exec_paths: vec![],
+            control_socket: None,
+            llm_socket: None,
+            allow_network: false,
+            allow_keychain: false,
+            mach_lookup_services: vec![],
+            allow_network_listeners: false,
+            tty: false,
+        };
+        let off = std::fs::read_to_string(generate_profile(&off_dir, &base).unwrap()).unwrap();
+        let service = "(allow mach-lookup (global-name \"mul-xpc (Apple)_OpenStep\"))";
+        assert!(!off.contains(service));
+
+        let on_data = ProfileData {
+            mach_lookup_services: vec!["mul-xpc (Apple)_OpenStep".into()],
+            ..base
+        };
+        let on = std::fs::read_to_string(generate_profile(&on_dir, &on_data).unwrap()).unwrap();
+        assert!(on.contains(service));
+        assert!(on.contains("; Additional XPC Mach services (--allow-xpc)"));
+
+        let _ = std::fs::remove_dir_all(&off_dir);
+        let _ = std::fs::remove_dir_all(&on_dir);
+    }
+
+    #[test]
     fn test_generate_profile_tty() {
         let dir = std::env::temp_dir().join("arapuca-test-profile-tty");
         let _ = std::fs::create_dir_all(&dir);
@@ -714,6 +758,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            mach_lookup_services: vec![],
             allow_network_listeners: false,
             tty: true,
         };
@@ -741,6 +786,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            mach_lookup_services: vec![],
             allow_network_listeners: false,
             tty: false,
         };
@@ -799,6 +845,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            mach_lookup_services: vec![],
             allow_network_listeners: false,
             tty: false,
         };
@@ -834,6 +881,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            mach_lookup_services: vec![],
             allow_network_listeners: false,
             tty: false,
         };
@@ -858,6 +906,7 @@ mod tests {
             llm_socket: None,
             allow_network: true,
             allow_keychain: false,
+            mach_lookup_services: vec![],
             allow_network_listeners: false,
             tty: false,
         };
@@ -933,6 +982,7 @@ mod tests {
             llm_socket: None,
             allow_network: false,
             allow_keychain: false,
+            mach_lookup_services: vec![],
             allow_network_listeners: false,
             tty: false,
         };
@@ -971,6 +1021,7 @@ mod tests {
             llm_socket: None,
             allow_network: true,
             allow_keychain: true,
+            mach_lookup_services: vec![],
             allow_network_listeners: false,
             tty: false,
         };
@@ -1004,6 +1055,7 @@ mod tests {
             llm_socket: Some("/tmp/sock/proxy.sock".into()),
             allow_network: false,
             allow_keychain: false,
+            mach_lookup_services: vec![],
             allow_network_listeners: false,
             tty: false,
         };

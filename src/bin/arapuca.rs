@@ -647,6 +647,7 @@ fn run_subcommand(args: &[String]) {
     let mut audit_network = false;
     let mut allow_proxy_env = false;
     let mut allow_keychain = false;
+    let mut mach_lookup_services: Vec<String> = Vec::new();
     let mut allow_network_listeners = false;
     let mut lpac = false;
 
@@ -693,6 +694,10 @@ fn run_subcommand(args: &[String]) {
             eprintln!(
                 "  --allow-keychain   allow macOS Keychain access; sets HOME to your \
                  home dir (macOS only)"
+            );
+            eprintln!(
+                "  --allow-xpc NAME  allow exact Mach service lookup; repeatable \
+                 (macOS only)"
             );
             eprintln!(
                 "  --allow-network-listeners  allow TCP bind/inbound (macOS Seatbelt cannot \
@@ -912,6 +917,19 @@ fn run_subcommand(args: &[String]) {
                      (macOS Keychain only)"
                 );
             }
+            "--allow-xpc" => {
+                i += 1;
+                let service = flag_args.get(i).unwrap_or_else(|| {
+                    eprintln!("--allow-xpc requires a Mach service name");
+                    std::process::exit(125);
+                });
+                mach_lookup_services.push(service.clone());
+                #[cfg(not(target_os = "macos"))]
+                eprintln!(
+                    "arapuca run: --allow-xpc has no effect on this platform \
+                     (macOS Mach services only)"
+                );
+            }
             "--allow-network-listeners" => {
                 allow_network_listeners = true;
                 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -946,12 +964,16 @@ fn run_subcommand(args: &[String]) {
     }
 
     // ── Flag validation ────────────────────────────────────────
-    if let Err(e) = (arapuca::Profile {
+    let cli_profile = arapuca::Profile {
         deny_unix_sockets,
+        mach_lookup_services: mach_lookup_services.clone(),
         ..Default::default()
-    })
-    .validate_unix_socket_policy()
-    {
+    };
+    if let Err(e) = cli_profile.validate_unix_socket_policy() {
+        eprintln!("arapuca run: {e}");
+        std::process::exit(125);
+    }
+    if let Err(e) = cli_profile.validate_mach_lookup_services() {
         eprintln!("arapuca run: {e}");
         std::process::exit(125);
     }
@@ -1059,6 +1081,7 @@ fn run_subcommand(args: &[String]) {
         seccomp_debug,
         allow_proxy_env,
         allow_keychain,
+        mach_lookup_services,
         allow_network_listeners,
         ..Default::default()
     };
