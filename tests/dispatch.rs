@@ -160,6 +160,36 @@ fn help_long_flag() {
 }
 
 #[test]
+fn run_help_lists_xpc_service_flag() {
+    let output = Command::new(arapuca_bin()).args(["run"]).output().unwrap();
+    let help = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        help.contains("--allow-xpc"),
+        "missing XPC service flag: {help}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn xpc_service_flag_launches_with_seatbelt() {
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--allow-xpc",
+            "mul-xpc (Apple)_OpenStep",
+            "--",
+            "/usr/bin/true",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "XPC service capability should launch successfully: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn version_short_flag() {
     let output = Command::new(arapuca_bin()).args(["-V"]).output().unwrap();
     assert!(output.status.success(), "-V should exit 0");
