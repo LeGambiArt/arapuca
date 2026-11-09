@@ -108,6 +108,30 @@ fn deny_network_with_allow_network_listeners_rejected() {
 }
 
 #[test]
+fn allow_xpc_cannot_swallow_a_flag_as_service_name() {
+    // Regression: `--allow-xpc --deny-network ...` used to consume
+    // `--deny-network` as the service name, skipping the mutual-exclusion
+    // check and running with network denial off.
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--allow-xpc",
+            "--deny-network",
+            "--allow-network-listeners",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid Mach service name"),
+        "should reject flag-as-service-name: {stderr}"
+    );
+}
+
+#[test]
 fn unknown_subcommand_rejected() {
     let output = Command::new(arapuca_bin())
         .args(["foo", "--", "/bin/true"])
@@ -156,6 +180,36 @@ fn help_long_flag() {
         .output()
         .unwrap();
     assert!(output.status.success(), "--help should exit 0");
+}
+
+#[test]
+fn run_help_lists_xpc_service_flag() {
+    let output = Command::new(arapuca_bin()).args(["run"]).output().unwrap();
+    let help = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        help.contains("--allow-xpc"),
+        "missing XPC service flag: {help}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn xpc_service_flag_launches_with_seatbelt() {
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--allow-xpc",
+            "mul-xpc (Apple)_OpenStep",
+            "--",
+            "/usr/bin/true",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "XPC service capability should launch successfully: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
