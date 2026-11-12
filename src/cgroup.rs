@@ -4,6 +4,11 @@
 //! Provides memory, CPU, and PID limits with OOM detection and resource
 //! usage telemetry.
 //!
+//! Ownership model: cgroup directories may be pid-encoded
+//! (`arapuca-<task-id>-<owner-pid>`); stale sweeps skip any cgroup
+//! whose encoded owner pid is provably alive. Names without a
+//! trailing pid (legacy) are reclaimed by emptiness only.
+//!
 //! Graceful degradation: if cgroups v2 is unavailable or controllers are
 //! not delegated, returns structured errors so the caller can decide the
 //! degradation policy (not hardcoded log-and-continue).
@@ -359,6 +364,15 @@ impl CgroupManager {
     /// routing), never a guard. An occupied cgroup is left behind: an
     /// orphaned cgroup is harmless (see `destroy()`), a killed
     /// sibling is not.
+    ///
+    /// Ownership: pid-encoded names (`arapuca-<task-id>-<owner-pid>`,
+    /// see `cgroup_dir_name()`) are skipped while their owner
+    /// process is alive — including the create→add_pid window of a
+    /// concurrently starting sibling. Only provably-dead owners and
+    /// legacy names (no trailing pid) are reclaimed. The sweep runs
+    /// once per supervisor start; the terminal backstop for anything
+    /// left behind is the delegated scope's own teardown (systemd
+    /// garbage-collects the subtree when the scope terminates).
     fn cleanup_stale(&self) {
         let entries = match fs::read_dir(&self.base_path) {
             Ok(e) => e,
@@ -378,7 +392,15 @@ impl CgroupManager {
             let label = if name_str == LEAF_NAME {
                 LEAF_NAME.to_string()
             } else if name_str.starts_with(CGROUP_PREFIX) {
-                name_str.into_owned()
+                match ownership_of(&name_str) {
+                    Ownership::Live(pid) => {
+                        log::debug!(
+                            "cgroup: {name_str} owner pid {pid} alive (live sibling), skipping"
+                        );
+                        continue;
+                    }
+                    Ownership::Legacy | Ownership::Dead(_) => name_str.into_owned(),
+                }
             } else {
                 continue;
             };
@@ -459,6 +481,83 @@ fn reclaim_if_empty(path: &Path, label: &str) -> ReclaimOutcome {
             ReclaimOutcome::Failed
         }
     }
+}
+
+/// Ownership verdict for an `arapuca-*` cgroup directory name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    /// Pre-ownership-encoding name (no trailing pid): reclaim by
+    /// emptiness only.
+    Legacy,
+    /// Pid-encoded name whose owner process is alive: never touch —
+    /// a live sibling's cgroup is untouchable, including the
+    /// create→add_pid launch window.
+    Live(u32),
+    /// Pid-encoded name whose owner process is provably dead:
+    /// reclaimable by rmdir (the kernel's EBUSY check still guards
+    /// any surviving member processes).
+    Dead(u32),
+}
+
+/// Parse the owner pid from an `arapuca-*` cgroup directory name.
+///
+/// Pid-encoded names are `arapuca-<task-id>-<owner-pid>`: the last
+/// hyphen-separated component is all digits with a non-empty
+/// task-id before it, and the pid is > 1 (init is never an owner).
+/// Everything else — no trailing numeric component, single
+/// component, pid 0/1, non-digit tail, overflow — reads as legacy.
+///
+/// Legacy names with a hyphen-numeric task-id (`arapuca-foo-2`) are
+/// indistinguishable from pid-encoded names by construction; the
+/// sweep treats them as pid-encoded, which is conservative in the
+/// safe direction (at worst, reclamation is delayed).
+fn parse_owner_pid(dir_name: &str) -> Option<u32> {
+    let name = dir_name.strip_prefix(CGROUP_PREFIX)?;
+    let (task, pid_str) = name.rsplit_once('-')?;
+    if task.is_empty() || !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pid = pid_str.parse::<u32>().ok()?;
+    if pid <= 1 {
+        return None;
+    }
+    Some(pid)
+}
+
+/// Determine the ownership of an `arapuca-*` cgroup directory name:
+/// legacy, live owner, or provably-dead owner.
+fn ownership_of(dir_name: &str) -> Ownership {
+    let Some(pid) = parse_owner_pid(dir_name) else {
+        return Ownership::Legacy;
+    };
+    if owner_alive(pid) {
+        Ownership::Live(pid)
+    } else {
+        Ownership::Dead(pid)
+    }
+}
+
+/// Check whether the process with the given pid is alive.
+///
+/// Fail-safe: any uncertainty (unreadable or malformed stat) reports
+/// alive — reclamation must never happen on a guess. A missing
+/// `/proc/<pid>` means dead. Zombies count as dead: the process has
+/// exited, and any surviving sandboxed child is guarded by the
+/// kernel's rmdir-EBUSY check during reclamation.
+fn owner_alive(pid: u32) -> bool {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(s) => s,
+        // Missing /proc/<pid>[/stat]: the process is gone.
+        Err(e) if e.kind() == ErrorKind::NotFound => return false,
+        // Unreadable (permissions, hidepid): assume alive.
+        Err(_) => return true,
+    };
+    // Fields: pid (comm) state ... — comm may contain spaces and
+    // parentheses, so parse after the final ')'.
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return true; // malformed: assume alive
+    };
+    !matches!(rest.trim_start().chars().next(), Some('Z'))
 }
 
 /// Discover the orchestrator's own cgroup path from /proc/self/cgroup.
@@ -924,6 +1023,146 @@ mod tests {
         // block the rmdir (ENOTEMPTY), leaving cg behind — so the
         // removal itself is the no-kill oracle.
         assert!(!cg.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_owner_pid_names() {
+        // Pid-encoded: task-id + trailing pid (> 1).
+        assert_eq!(parse_owner_pid("arapuca-foo-1234"), Some(1234));
+        assert_eq!(parse_owner_pid("arapuca-foo-bar-1234"), Some(1234));
+        assert_eq!(parse_owner_pid("arapuca-123-456"), Some(456));
+        // Legacy: no trailing numeric component.
+        assert_eq!(parse_owner_pid("arapuca-foo"), None);
+        assert_eq!(parse_owner_pid("arapuca-foo-bar"), None);
+        assert_eq!(parse_owner_pid("arapuca-foo-12a"), None);
+        // Legacy: single component (all-numeric legacy task-id).
+        assert_eq!(parse_owner_pid("arapuca-123"), None);
+        // Empty task-id before the pid.
+        assert_eq!(parse_owner_pid("arapuca--123"), None);
+        // pid 0 and init are never owners.
+        assert_eq!(parse_owner_pid("arapuca-foo-0"), None);
+        assert_eq!(parse_owner_pid("arapuca-foo-1"), None);
+        // Beyond u32: cannot be a real pid on this system.
+        assert_eq!(parse_owner_pid("arapuca-foo-99999999999"), None);
+        // Not an arapuca cgroup name at all.
+        assert_eq!(parse_owner_pid("leaf"), None);
+        assert_eq!(parse_owner_pid("unrelated"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ownership_of_live_owner_is_the_test_process() {
+        // The test process itself is a live owner of its own pid.
+        let name = format!("arapuca-foo-{}", std::process::id());
+        assert_eq!(ownership_of(&name), Ownership::Live(std::process::id()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ownership_of_dead_owner_after_reaping() {
+        // Spawn a child, let it exit, and reap it: /proc/<pid> is
+        // gone afterwards, so the pid is provably dead (and cannot
+        // be reused while we still remember it as a zombie child we
+        // already waited for).
+        let mut child = std::process::Command::new("/bin/true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        // Precondition: the reaped pid must be gone from /proc, or
+        // the test is not testing what it claims.
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "reaped child pid {pid} still present in /proc"
+        );
+        let name = format!("arapuca-foo-{pid}");
+        assert_eq!(ownership_of(&name), Ownership::Dead(pid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ownership_of_zombie_owner_is_dead() {
+        // Spawn a child that exits WITHOUT being reaped: it stays as
+        // a zombie (present in /proc, state Z) until we wait for it.
+        let mut child = std::process::Command::new("/bin/true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Busy-wait briefly until the child shows up as a zombie:
+        // /proc/<pid>/stat state becomes Z once it exits unreaped.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut zombie = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+                if let Some((_, rest)) = stat.rsplit_once(')') {
+                    if rest.trim_start().starts_with('Z') {
+                        zombie = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(zombie, "child {pid} did not become a zombie");
+        let name = format!("arapuca-foo-{pid}");
+        assert_eq!(ownership_of(&name), Ownership::Dead(pid));
+        let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_stale_skips_live_owner() {
+        let dir = std::env::temp_dir().join("arapuca-test-cleanup-live-owner");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Bare (reclaimable) directory owned by a live pid — the
+        // test process itself. The liveness skip must protect it
+        // even though it is empty; without the ownership check the
+        // sweep would reclaim it.
+        let cg = dir.join(format!("arapuca-foo-{}", std::process::id()));
+        fs::create_dir(&cg).unwrap();
+        let mgr = CgroupManager {
+            base_path: dir.clone(),
+            controllers: vec!["memory".into()],
+        };
+        mgr.cleanup_stale();
+        assert!(cg.exists(), "live owner's cgroup must survive the sweep");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_stale_reclaims_dead_owner() {
+        let dir = std::env::temp_dir().join("arapuca-test-cleanup-dead-owner");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut child = std::process::Command::new("/bin/true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let _ = child.wait().unwrap();
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "reaped child pid {pid} still present in /proc"
+        );
+        // Bare directory (tmpfs note as in the other reclamation
+        // tests) owned by a provably-dead pid: must be reclaimed.
+        let cg = dir.join(format!("arapuca-foo-{pid}"));
+        fs::create_dir(&cg).unwrap();
+        let mgr = CgroupManager {
+            base_path: dir.clone(),
+            controllers: vec!["memory".into()],
+        };
+        mgr.cleanup_stale();
+        assert!(!cg.exists(), "dead owner's cgroup must be reclaimed");
         let _ = fs::remove_dir_all(&dir);
     }
 }
