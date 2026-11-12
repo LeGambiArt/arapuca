@@ -9,7 +9,7 @@
 //! degradation policy (not hardcoded log-and-continue).
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -350,11 +350,23 @@ impl CgroupManager {
     }
 
     /// Clean up leftover cgroup directories from previous sessions.
+    ///
+    /// NEVER kills: reclamation is by rmdir only. On cgroupfs, rmdir
+    /// fails with EBUSY while the cgroup has member processes or child
+    /// cgroups — that kernel check is the safety mechanism that
+    /// protects live siblings sharing a delegated scope. The
+    /// `cgroup.procs` read inside the reclaim helper is advisory (log
+    /// routing), never a guard. An occupied cgroup is left behind: an
+    /// orphaned cgroup is harmless (see `destroy()`), a killed
+    /// sibling is not.
     fn cleanup_stale(&self) {
         let entries = match fs::read_dir(&self.base_path) {
             Ok(e) => e,
             Err(_) => return,
         };
+        let mut reclaimed = 0usize;
+        let mut occupied = 0usize;
+        let mut failed = 0usize;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
@@ -362,31 +374,26 @@ impl CgroupManager {
                 continue;
             }
 
-            if name_str == LEAF_NAME {
-                // Stale leaf from a previous run: rmdir only (never
-                // cgroup.kill — it could contain a sibling orchestrator).
-                let leaf = entry.path();
-                let procs = fs::read_to_string(leaf.join("cgroup.procs")).unwrap_or_default();
-                if procs.trim().is_empty() && fs::remove_dir(&leaf).is_ok() {
-                    log::info!("cgroup: cleaned up stale leaf");
-                }
+            let path = entry.path();
+            let label = if name_str == LEAF_NAME {
+                LEAF_NAME.to_string()
+            } else if name_str.starts_with(CGROUP_PREFIX) {
+                name_str.into_owned()
+            } else {
                 continue;
-            }
+            };
 
-            if !name_str.starts_with(CGROUP_PREFIX) {
-                continue;
+            match reclaim_if_empty(&path, &label) {
+                ReclaimOutcome::Reclaimed => reclaimed += 1,
+                ReclaimOutcome::Occupied => occupied += 1,
+                ReclaimOutcome::Failed => failed += 1,
             }
-
-            let cg_path = entry.path();
-            let kill_path = cg_path.join("cgroup.kill");
-            if fs::write(&kill_path, "1").is_err() {
-                self.kill_procs(&cg_path);
-            }
-            thread::sleep(DESTROY_BACKOFF);
-            match fs::remove_dir(&cg_path) {
-                Ok(()) => log::info!("cgroup: cleaned up stale cgroup {name_str}"),
-                Err(e) => log::warn!("cgroup: stale cleanup: could not remove {name_str}: {e}"),
-            }
+        }
+        if reclaimed + occupied + failed > 0 {
+            log::info!(
+                "cgroup: stale sweep: reclaimed {reclaimed}, \
+                 skipped {occupied} occupied, failed {failed}"
+            );
         }
     }
 
@@ -407,6 +414,49 @@ impl CgroupManager {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Outcome of a never-kill reclamation attempt on a cgroup directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimOutcome {
+    /// Removed by this sweep, or already gone via a concurrent sweep.
+    Reclaimed,
+    /// `cgroup.procs` non-empty — assumed live sibling, left alone.
+    Occupied,
+    /// rmdir failed for a non-benign reason.
+    Failed,
+}
+
+/// Reclaim a leftover cgroup directory by rmdir only — NEVER by
+/// killing (no `cgroup.kill` write, no `kill(2)`).
+///
+/// The kernel's EBUSY check on cgroupfs rmdir is the safety
+/// mechanism: rmdir fails while the cgroup has member processes or
+/// child cgroups, so an occupied cgroup — most likely a live sibling
+/// sharing the delegated scope — cannot be destroyed. The
+/// `cgroup.procs` read here is advisory only (log routing); it must
+/// never be treated as the guard.
+fn reclaim_if_empty(path: &Path, label: &str) -> ReclaimOutcome {
+    let procs = fs::read_to_string(path.join("cgroup.procs")).unwrap_or_default();
+    if !procs.trim().is_empty() {
+        log::debug!("cgroup: {label} occupied (likely live sibling), skipping");
+        return ReclaimOutcome::Occupied;
+    }
+    match fs::remove_dir(path) {
+        Ok(()) => {
+            log::info!("cgroup: cleaned up stale {label}");
+            ReclaimOutcome::Reclaimed
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // A concurrent sweep already reclaimed it.
+            log::debug!("cgroup: {label} already gone (concurrent reclaim)");
+            ReclaimOutcome::Reclaimed
+        }
+        Err(e) => {
+            log::warn!("cgroup: could not remove stale {label}: {e}");
+            ReclaimOutcome::Failed
         }
     }
 }
@@ -804,6 +854,76 @@ mod tests {
         };
         mgr.cleanup_stale();
         assert!(leaf.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_stale_removes_empty_task_cgroup() {
+        let dir = std::env::temp_dir().join("arapuca-test-cleanup-task-empty");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Bare directory, no cgroup.procs file (same tmpfs note as
+        // cleanup_stale_removes_empty_leaf): a regular cgroup.procs
+        // file would make remove_dir fail ENOTEMPTY here even when
+        // "empty", routing the test through the warn branch instead
+        // of the reclamation branch.
+        let cg = dir.join("arapuca-foo");
+        fs::create_dir(&cg).unwrap();
+        let mgr = CgroupManager {
+            base_path: dir.clone(),
+            controllers: vec!["memory".into()],
+        };
+        mgr.cleanup_stale();
+        assert!(!cg.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_stale_preserves_occupied_task_cgroup() {
+        let dir = std::env::temp_dir().join("arapuca-test-cleanup-task-busy");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cg = dir.join("arapuca-foo");
+        fs::create_dir(&cg).unwrap();
+        // Non-allocatable PID (pid_max ceiling is 4194304, this is
+        // above it): if a regression reintroduces kill_procs() into
+        // the sweep, the kill(2) targets a pid that cannot exist.
+        fs::write(cg.join("cgroup.procs"), "2000000000\n").unwrap();
+        let mgr = CgroupManager {
+            base_path: dir.clone(),
+            controllers: vec!["memory".into()],
+        };
+        mgr.cleanup_stale();
+        assert!(cg.exists());
+        // A kill write would materialize cgroup.kill on a tempdir.
+        assert!(!cg.join("cgroup.kill").exists());
+        assert_eq!(
+            fs::read_to_string(cg.join("cgroup.procs")).unwrap(),
+            "2000000000\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_stale_no_kill_write_on_empty() {
+        let dir = std::env::temp_dir().join("arapuca-test-cleanup-task-no-kill");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Bare directory, no cgroup.procs file — same tmpfs note as
+        // cleanup_stale_removes_empty_leaf.
+        let cg = dir.join("arapuca-foo");
+        fs::create_dir(&cg).unwrap();
+        let mgr = CgroupManager {
+            base_path: dir.clone(),
+            controllers: vec!["memory".into()],
+        };
+        mgr.cleanup_stale();
+        // Reclaimed by rmdir only: no kill may ever be attempted, even
+        // for provably-stale (empty) cgroups. On a tempdir, a kill
+        // write would materialize cgroup.kill inside the directory and
+        // block the rmdir (ENOTEMPTY), leaving cg behind — so the
+        // removal itself is the no-kill oracle.
+        assert!(!cg.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }
