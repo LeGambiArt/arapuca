@@ -538,7 +538,18 @@ pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
         PathBuf::from("/etc/passwd"),
         PathBuf::from("/etc/group"),
         // Device nodes (curated, not blanket /dev).
-        PathBuf::from("/dev/null"),
+        // /dev/null is granted read-write in the write list below:
+        // opening it O_RDWR is the standard POSIX discard-sink
+        // pattern (libuv-based tools such as BIND 9.20 nslookup/dig
+        // require it at init). The grant is file-scoped — Landlock
+        // rules on a non-directory path cannot confer
+        // directory-manipulation rights (those are checked against
+        // the parent hierarchy, i.e. /dev, which is not granted) —
+        // and writes are discarded by the driver. Note the grant is
+        // additive: it cannot be revoked per-run via `-v
+        // /dev/null:ro`. /dev/zero, /dev/urandom and /dev/random
+        // stay read-only (no demonstrated need for write access;
+        // macOS Seatbelt grants write on /dev/null only).
         PathBuf::from("/dev/zero"),
         PathBuf::from("/dev/urandom"),
         PathBuf::from("/dev/random"),
@@ -547,7 +558,9 @@ pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
         // processes/users. Callers must opt in explicitly via
         // `-v /tmp/some-subdir` (or similar) if they need it visible.
     ];
-    let write = Vec::new();
+    // /dev/null rw: harmless discard sink, required by the common
+    // O_RDWR open pattern (see the device-nodes note above).
+    let write = vec![PathBuf::from("/dev/null")];
     (read, write)
 }
 
@@ -1096,12 +1109,24 @@ mod tests {
     }
 
     #[test]
-    fn default_sandbox_paths_no_default_writes() {
+    fn default_sandbox_paths_write_grants_only_devnull() {
         let (_read, write) = default_sandbox_paths();
-        assert!(
-            write.is_empty(),
-            "default write paths should be empty (private temp dir is added by the launcher)"
-        );
+        // The only default write grant is the /dev/null discard
+        // sink (file-scoped rights; see default_sandbox_paths docs).
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                write,
+                vec![PathBuf::from("/dev/null")],
+                "default write paths must be exactly /dev/null"
+            );
+        }
+        // Other platforms return empty lists (their sandbox
+        // mechanisms handle device policy themselves).
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(write.is_empty());
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1110,8 +1135,9 @@ mod tests {
         let (read, write) = default_sandbox_paths();
         assert!(read.iter().any(|p| p == Path::new("/usr")));
         assert!(read.iter().any(|p| p == Path::new("/bin")));
-        assert!(read.iter().any(|p| p == Path::new("/dev/null")));
-        assert!(write.is_empty());
+        // /dev/null is granted rw (write list), not read-only.
+        assert!(!read.iter().any(|p| p == Path::new("/dev/null")));
+        assert!(write.iter().any(|p| p == Path::new("/dev/null")));
     }
 
     #[cfg(target_os = "linux")]
