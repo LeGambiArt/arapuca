@@ -4,10 +4,12 @@
 //! Provides memory, CPU, and PID limits with OOM detection and resource
 //! usage telemetry.
 //!
-//! Ownership model: cgroup directories may be pid-encoded
-//! (`arapuca-<task-id>-<owner-pid>`); stale sweeps skip any cgroup
-//! whose encoded owner pid is provably alive. Names without a
-//! trailing pid (legacy) are reclaimed by emptiness only.
+//! Ownership model: cgroup directories are pid-encoded
+//! (`arapuca-<task-id>-<owner-pid>`, the supervisor process that
+//! created them), so concurrent supervisors under one delegated
+//! scope never collide. Stale sweeps skip any cgroup whose encoded
+//! owner pid is provably alive; names without a trailing pid
+//! (legacy) are reclaimed by emptiness only.
 //!
 //! Graceful degradation: if cgroups v2 is unavailable or controllers are
 //! not delegated, returns structured errors so the caller can decide the
@@ -164,10 +166,21 @@ impl CgroupManager {
         let clean_id = crate::sanitize_task_id(task_id)?;
         limits.validate()?;
 
-        let cg_path = self.base_path.join(format!("{CGROUP_PREFIX}{clean_id}"));
+        let cg_path = self
+            .base_path
+            .join(cgroup_dir_name(clean_id, std::process::id()));
 
-        fs::create_dir(&cg_path)
-            .map_err(|e| Error::Cgroup(format!("mkdir {}: {e}", cg_path.display())))?;
+        fs::create_dir(&cg_path).map_err(|e| {
+            let hint = if e.kind() == ErrorKind::AlreadyExists {
+                " — name collision: either create() was called twice for this \
+                 task id in this process, or the directory encodes this pid from \
+                 a previous process (pid reuse); it becomes reclaimable once \
+                 this process exits and a later sweep runs"
+            } else {
+                ""
+            };
+            Error::Cgroup(format!("mkdir {}: {e}{hint}", cg_path.display()))
+        })?;
 
         match self.write_controller_files(&cg_path, limits) {
             Ok(status) => {
@@ -497,6 +510,13 @@ enum Ownership {
     /// reclaimable by rmdir (the kernel's EBUSY check still guards
     /// any surviving member processes).
     Dead(u32),
+}
+
+/// Build a cgroup directory name for a task, encoding the owner pid
+/// so concurrent supervisors never collide and stale sweeps can prove
+/// ownership (see `parse_owner_pid`).
+fn cgroup_dir_name(task_id: &str, owner_pid: u32) -> String {
+    format!("{CGROUP_PREFIX}{task_id}-{owner_pid}")
 }
 
 /// Parse the owner pid from an `arapuca-*` cgroup directory name.
@@ -1163,6 +1183,43 @@ mod tests {
         };
         mgr.cleanup_stale();
         assert!(!cg.exists(), "dead owner's cgroup must be reclaimed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cgroup_name_round_trip() {
+        // cgroup_dir_name and parse_owner_pid are inverses for any
+        // sanitizable task-id shape.
+        for task_id in ["foo", "foo-bar", "123", "evidence-contracts-2"] {
+            let name = cgroup_dir_name(task_id, 4242);
+            assert!(name.starts_with(CGROUP_PREFIX));
+            assert_eq!(parse_owner_pid(&name), Some(4242), "task-id: {task_id}");
+        }
+    }
+
+    #[test]
+    fn create_same_task_id_same_process_eexist() {
+        // Within one process the owner pid is fixed, so a second
+        // create() for the same task id must fail loudly — this
+        // protects same-process concurrency (e.g. FFI threads).
+        let dir = std::env::temp_dir().join("arapuca-test-create-eexist");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mgr = CgroupManager {
+            base_path: dir.clone(),
+            controllers: vec!["memory".into()],
+        };
+        let limits = CgroupLimits {
+            memory_max_mb: 64,
+            ..CgroupLimits::default()
+        };
+        let first = mgr.create("dup", &limits).unwrap();
+        assert!(first.memory_applied);
+        assert!(first.path.is_some());
+        let second = mgr.create("dup", &limits);
+        let err = second.err().expect("second create must EEXIST");
+        let msg = err.to_string();
+        assert!(msg.contains("name collision"), "got: {msg}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -137,6 +137,47 @@ fn devnull_unlink_denied() {
 }
 
 #[test]
+fn concurrent_same_task_id_both_succeed() {
+    // Two arapuca runs with the same --task-id inside one delegated
+    // scope must both succeed: per-pid cgroup names make same-task-id
+    // collisions between distinct processes impossible. Requires a
+    // systemd user session with cgroup delegation; skips otherwise.
+    let probe = Command::new("systemd-run")
+        .args(["--user", "--scope", "-p", "Delegate=yes", "--", "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !matches!(&probe, Ok(s) if s.success()) {
+        eprintln!("skipping: systemd-run --user --scope with Delegate=yes unavailable");
+        return;
+    }
+
+    let bin = arapuca_bin().display().to_string();
+    let inner = format!(
+        "{bin} run --task-id dup-test --memory 64 -- /bin/true & p1=$!; \
+         {bin} run --task-id dup-test --memory 64 -- /bin/true & p2=$!; \
+         wait $p1 && wait $p2"
+    );
+    let status = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "-p",
+            "Delegate=yes",
+            "--",
+            "/bin/sh",
+            "-c",
+            &inner,
+        ])
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "two concurrent runs with the same --task-id must both succeed"
+    );
+}
+
+#[test]
 fn allow_network_listeners_confines_tcp_to_netns_loopback() {
     if !arapuca::netns::available() {
         eprintln!("skipping listener namespace test: unprivileged netns unavailable");
