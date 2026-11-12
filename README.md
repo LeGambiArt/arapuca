@@ -180,7 +180,8 @@ arapuca run \
 
 # The sandboxed process:
 # - Can only read default system paths + explicitly granted -v paths
-# - Can only write to its private temp dir (use -v /path for more)
+# - Can only write to its private temp dir and /dev/null (discard
+#   sink; use -v /path for more)
 # - Gets a minimal environment (HOME, TMPDIR, PATH, LANG) + --env vars
 # - Is killed after --timeout seconds (SIGTERM, then SIGKILL after 5s)
 # - Cannot override sandbox-managed env vars (HOME, TMPDIR, PATH, LANG)

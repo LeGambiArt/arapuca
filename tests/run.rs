@@ -86,6 +86,57 @@ fn default_paths_sufficient_for_basic_commands() {
 }
 
 #[test]
+fn devnull_opendrdwr_succeeds() {
+    // Opening /dev/null O_RDWR is the standard POSIX discard-sink
+    // pattern; libuv-based tools (BIND 9.20 nslookup/dig) require it
+    // at init and die otherwise. The default policy must grant it.
+    let status = Command::new(arapuca_bin())
+        .args(["run", "--", "/bin/sh", "-c", "exec 3<>/dev/null"])
+        .status()
+        .unwrap();
+
+    assert!(
+        status.success(),
+        "open(/dev/null, O_RDWR) must succeed with default paths"
+    );
+}
+
+#[test]
+fn devurandom_opendrdwr_denied() {
+    // The read-only boundary on entropy device nodes must hold:
+    // only /dev/null gets a default write grant.
+    let output = Command::new(arapuca_bin())
+        .args(["run", "--", "/bin/sh", "-c", "exec 3<>/dev/urandom"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "open(/dev/urandom, O_RDWR) must be denied by default"
+    );
+}
+
+#[test]
+fn devnull_unlink_denied() {
+    // The /dev/null write grant is file-scoped: Landlock rules on
+    // the node cannot confer directory-manipulation rights, which
+    // are checked against the (ungranted) parent /dev hierarchy.
+    let output = Command::new(arapuca_bin())
+        .args(["run", "--", "/bin/sh", "-c", "rm -f /dev/null"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "unlink of /dev/null must be denied (no parent-dir rights)"
+    );
+    assert!(
+        PathBuf::from("/dev/null").exists(),
+        "/dev/null must still exist after the attempt"
+    );
+}
+
+#[test]
 fn allow_network_listeners_confines_tcp_to_netns_loopback() {
     if !arapuca::netns::available() {
         eprintln!("skipping listener namespace test: unprivileged netns unavailable");
@@ -812,17 +863,36 @@ fn pty_bidirectional_io_no_deadlock() {
         .spawn()
         .unwrap();
 
+    // Drain output concurrently: the inner dd pushes 64 KiB through
+    // the PTY, which exceeds the pipe capacity — reading only after
+    // wait() would deadlock the harness itself and mask what the
+    // test actually verifies (arapuca's PTY passthrough draining).
+    let stdout_handle = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            use std::io::Read;
+            let _ = out.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            use std::io::Read;
+            let _ = err.read_to_string(&mut buf);
+            buf
+        })
+    });
+
     let result = wait_with_timeout(&mut child, std::time::Duration::from_secs(15));
     match result {
         Some(status) => {
-            let stdout = {
-                let mut buf = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = out.read_to_string(&mut buf);
-                }
-                buf
-            };
+            let stdout = stdout_handle
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
+            let _stderr = stderr_handle
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
             let clean = stdout.replace('\r', "");
             assert!(
                 clean.contains("PTY_IO_OK"),
