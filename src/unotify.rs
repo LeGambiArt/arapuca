@@ -299,6 +299,7 @@ fn read_string(mem: &MemFd, addr: u64, max_len: usize) -> Option<String> {
 }
 
 /// Parsed sockaddr information.
+#[derive(Debug)]
 pub struct SockaddrInfo {
     /// Address family (AF_INET, AF_INET6, etc.).
     pub family: u16,
@@ -308,11 +309,33 @@ pub struct SockaddrInfo {
     pub port: u16,
 }
 
+/// Parsed AF_UNIX sockaddr contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnixSockaddr {
+    /// Filesystem socket: `sun_path[0] != 0` and NUL-terminated
+    /// within the given length.
+    Path(String),
+    /// Abstract-namespace socket: `sun_path[0] == 0`; the name is
+    /// the raw bytes after the leading NUL (length-delimited, not
+    /// NUL-terminated).
+    Abstract(Vec<u8>),
+    /// No path bytes at all (`addrlen == sizeof(sa_family_t)`).
+    Unnamed,
+    /// Filesystem path not NUL-terminated within the given length —
+    /// structurally invalid for `connect()`.
+    Unterminated,
+}
+
 /// Result of reading a sockaddr from a target process.
+#[derive(Debug)]
 pub enum SockaddrResult {
     /// Successfully read an AF_INET or AF_INET6 address.
     Inet(SockaddrInfo),
-    /// Successfully read the family but it's not INET (AF_UNIX, etc.).
+    /// Successfully read an AF_UNIX address (filesystem path,
+    /// abstract name, unnamed, or structurally unterminated).
+    Unix(UnixSockaddr),
+    /// Successfully read the family but it's neither INET nor UNIX
+    /// (AF_NETLINK, etc.).
     NonInet(u16),
     /// Failed to read the sockaddr (process exited, unmapped, etc.).
     ReadFailed,
@@ -377,6 +400,43 @@ fn read_sockaddr(mem: &MemFd, addr: u64, addrlen: u64) -> SockaddrResult {
             }
         }
         libc::AF_INET | libc::AF_INET6 => SockaddrResult::ReadFailed, // addrlen too short
+        libc::AF_UNIX => {
+            // The kernel rejects connect() sockaddrs longer than
+            // sizeof(sockaddr_un); cap the read so we never touch
+            // memory beyond min(addrlen, sizeof(sockaddr_un)).
+            const SOCKADDR_UN_SIZE: u64 = std::mem::size_of::<libc::sockaddr_un>() as u64;
+            let len = addrlen.min(SOCKADDR_UN_SIZE);
+            let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            let n = unsafe {
+                libc::pread(
+                    fd,
+                    &mut sa as *mut libc::sockaddr_un as *mut libc::c_void,
+                    len as usize,
+                    addr as libc::off_t,
+                )
+            };
+            if n != len as isize {
+                return SockaddrResult::ReadFailed;
+            }
+            let path_len = (len - std::mem::size_of::<libc::sa_family_t>() as u64) as usize;
+            // SAFETY: sun_path is a fixed-size array of c_char living
+            // for the duration of this function; path_len is bounded
+            // by the sockaddr_un size.
+            let path_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(sa.sun_path.as_ptr().cast::<u8>(), path_len) };
+            if path_bytes.is_empty() {
+                SockaddrResult::Unix(UnixSockaddr::Unnamed)
+            } else if path_bytes[0] == 0 {
+                SockaddrResult::Unix(UnixSockaddr::Abstract(path_bytes[1..].to_vec()))
+            } else {
+                match path_bytes.iter().position(|&b| b == 0) {
+                    Some(end) => SockaddrResult::Unix(UnixSockaddr::Path(
+                        String::from_utf8_lossy(&path_bytes[..end]).into_owned(),
+                    )),
+                    None => SockaddrResult::Unix(UnixSockaddr::Unterminated),
+                }
+            }
+        }
         _ => SockaddrResult::NonInet(family),
     }
 }
@@ -607,8 +667,14 @@ fn handle_connect(
                 }
             }
         }
+        SockaddrResult::Unix(_) => {
+            // AF_UNIX — audit-only mode does not enforce Unix socket
+            // connects; allow through (the connect broker handles
+            // these when the UDS policy is active).
+            respond_continue(listener_fd, notif)
+        }
         SockaddrResult::NonInet(_) => {
-            // AF_UNIX, AF_NETLINK, etc. — not INET, allow through.
+            // AF_NETLINK, etc. — not INET, allow through.
             respond_continue(listener_fd, notif)
         }
         SockaddrResult::ReadFailed => {
@@ -637,6 +703,7 @@ fn sendmsg_should_block(mem: &MemFd, msghdr_addr: u64, config: &UnotifyConfig) -
         (Some(name_addr), Some(namelen)) if name_addr != 0 && namelen > 0 => {
             match read_sockaddr(mem, name_addr, namelen as u64) {
                 SockaddrResult::Inet(info) => !is_bridge_addr(&info, config),
+                SockaddrResult::Unix(_) => false,
                 SockaddrResult::NonInet(_) => false,
                 SockaddrResult::ReadFailed => config.enforce_network,
             }
@@ -1654,5 +1721,153 @@ mod tests {
             "child should exit normally, not be killed by seccomp"
         );
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    // ─── AF_UNIX sockaddr parsing ─────────────────────────────────
+
+    /// Read a sockaddr from this process's own memory via /proc/self/mem.
+    fn read_own_sockaddr(bytes: &[u8], addrlen: u64) -> SockaddrResult {
+        let mem = MemFd::open(std::process::id()).expect("open own /proc/pid/mem");
+        read_sockaddr(&mem, bytes.as_ptr() as u64, addrlen)
+    }
+
+    /// Build a sockaddr_un with the given path and compute addrlen
+    /// the way a caller passing a NUL-terminated path would.
+    fn unix_sa(path: &[u8]) -> (libc::sockaddr_un, u64) {
+        let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (i, &b) in path.iter().enumerate() {
+            sa.sun_path[i] = b as libc::c_char;
+        }
+        let addrlen = std::mem::size_of::<libc::sa_family_t>() + path.len() + 1;
+        (sa, addrlen as u64)
+    }
+
+    /// Build an abstract-namespace sockaddr_un: leading NUL plus the
+    /// name, length-delimited with no trailing NUL.
+    fn unix_abstract_sa(name: &[u8]) -> (libc::sockaddr_un, u64) {
+        let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        sa.sun_path[0] = 0;
+        for (i, &b) in name.iter().enumerate() {
+            sa.sun_path[1 + i] = b as libc::c_char;
+        }
+        let addrlen = std::mem::size_of::<libc::sa_family_t>() + 1 + name.len();
+        (sa, addrlen as u64)
+    }
+
+    fn sa_bytes(sa: &libc::sockaddr_un, len: u64) -> Vec<u8> {
+        unsafe { std::slice::from_raw_parts(sa as *const _ as *const u8, len as usize) }.to_vec()
+    }
+
+    #[test]
+    fn unix_sockaddr_filesystem_path() {
+        let (sa, len) = unix_sa(b"/run/docker.sock");
+        let bytes = sa_bytes(&sa, len);
+        match read_own_sockaddr(&bytes, len) {
+            SockaddrResult::Unix(UnixSockaddr::Path(p)) => assert_eq!(p, "/run/docker.sock"),
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unix_sockaddr_abstract_name() {
+        let (sa, len) = unix_abstract_sa(b"abstract-name");
+        let bytes = sa_bytes(&sa, len);
+        match read_own_sockaddr(&bytes, len) {
+            SockaddrResult::Unix(UnixSockaddr::Abstract(n)) => {
+                assert_eq!(n, b"abstract-name".to_vec())
+            }
+            other => panic!("expected Abstract, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unix_sockaddr_abstract_empty_name() {
+        let (sa, len) = unix_abstract_sa(b"");
+        let bytes = sa_bytes(&sa, len);
+        match read_own_sockaddr(&bytes, len) {
+            SockaddrResult::Unix(UnixSockaddr::Abstract(n)) => assert!(n.is_empty()),
+            other => panic!("expected Abstract(empty), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unix_sockaddr_unnamed() {
+        let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let len = std::mem::size_of::<libc::sa_family_t>() as u64;
+        let bytes = sa_bytes(&sa, len);
+        match read_own_sockaddr(&bytes, len) {
+            SockaddrResult::Unix(UnixSockaddr::Unnamed) => {}
+            other => panic!("expected Unnamed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unix_sockaddr_unterminated_path() {
+        // Fill sun_path completely with non-NUL bytes.
+        let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for b in sa.sun_path.iter_mut() {
+            *b = b'a' as libc::c_char;
+        }
+        let len = std::mem::size_of::<libc::sockaddr_un>() as u64;
+        let bytes = sa_bytes(&sa, len);
+        match read_own_sockaddr(&bytes, len) {
+            SockaddrResult::Unix(UnixSockaddr::Unterminated) => {}
+            other => panic!("expected Unterminated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unix_sockaddr_read_caps_at_sockaddr_un_size() {
+        // addrlen larger than sizeof(sockaddr_un): the read is capped
+        // and a NUL within the zeroed tail still terminates the path.
+        let (sa, _) = unix_sa(b"/tmp/short.sock");
+        let len = std::mem::size_of::<libc::sockaddr_un>() as u64;
+        let bytes = sa_bytes(&sa, len);
+        match read_own_sockaddr(&bytes, len) {
+            SockaddrResult::Unix(UnixSockaddr::Path(p)) => assert_eq!(p, "/tmp/short.sock"),
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unix_sockaddr_short_read_fails() {
+        // Place the sockaddr at the end of a mapped page followed by
+        // an unmapped hole so the capped pread faults (PROT_NONE is
+        // NOT enough: /proc/pid/mem reads use FOLL_FORCE and pass
+        // through it).
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                (libc::sysconf(libc::_SC_PAGESIZE) * 2) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        // Unmap the second page, leaving a hole after the first.
+        let unmap =
+            unsafe { libc::munmap((page as usize + page_size) as *mut libc::c_void, page_size) };
+        assert_eq!(unmap, 0);
+
+        // Sockaddr starts 4 bytes before the end of the mapped page;
+        // a 110-byte read crosses into the hole.
+        let sa_ptr = (page as usize + page_size - 4) as *mut libc::sockaddr_un;
+        unsafe {
+            std::ptr::write_unaligned(sa_ptr as *mut u16, libc::AF_UNIX as u16);
+        }
+        let mem = MemFd::open(std::process::id()).expect("open own /proc/pid/mem");
+        let result = read_sockaddr(&mem, sa_ptr as u64, 110);
+        unsafe { libc::munmap(page, page_size) };
+        assert!(
+            matches!(result, SockaddrResult::ReadFailed),
+            "expected ReadFailed, got {result:?}"
+        );
     }
 }
