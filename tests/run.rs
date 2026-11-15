@@ -1216,6 +1216,29 @@ fn private_tmpdir_writable_but_slash_tmp_blocked() {
     );
 }
 
+#[test]
+fn etc_containers_enumerable_by_default() {
+    // Regression: container tooling (podman, buildah) enumerates
+    // /etc/containers during configuration parsing. Individual file
+    // reads under granted files worked, but directory enumeration
+    // needs the directory itself in the read paths.
+    let output = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            "ls /etc/containers >/dev/null && echo LS_OK",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("LS_OK"),
+        "ls /etc/containers should succeed by default: {stdout}"
+    );
+}
+
 // ─── --deny-network tests ─────────────────────────────────────
 
 fn netns_root_available() -> bool {

@@ -608,6 +608,13 @@ pub fn default_sandbox_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
         PathBuf::from("/etc/host.conf"),
         PathBuf::from("/etc/nsswitch.conf"),
         PathBuf::from("/etc/ld.so.cache"),
+        // Container tooling configuration (containers.conf,
+        // registries.conf, policy.json). No credentials: auth.json
+        // lives under the user's XDG runtime dir, not here.
+        PathBuf::from("/etc/containers"),
+        // Subuid/subgid allocation maps (same class as /etc/passwd).
+        PathBuf::from("/etc/subuid"),
+        PathBuf::from("/etc/subgid"),
         // Locale and user info.
         PathBuf::from("/etc/localtime"),
         PathBuf::from("/etc/passwd"),
