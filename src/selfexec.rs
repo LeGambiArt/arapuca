@@ -467,6 +467,28 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
                                 ));
                                 unsafe { libc::_exit(1) };
                             }
+                            // Wait for the supervisor to duplicate the
+                            // listener fd BEFORE exec (see bin/arapuca.rs).
+                            if !crate::unotify::wait_fd_ack(fds.socketpair_parent, 5000) {
+                                if policy_active {
+                                    write_stderr(
+                                        "arapuca: selfexec: unotify supervisor did not \
+                                         take over the listener fd\n",
+                                    );
+                                    write_stderr(
+                                        "arapuca: selfexec: refusing to run without the \
+                                         unix socket connect policy enforced\n",
+                                    );
+                                    unsafe {
+                                        libc::close(fds.socketpair_parent);
+                                        libc::_exit(125);
+                                    }
+                                }
+                                write_stderr(
+                                    "arapuca: selfexec: unotify supervisor did not take \
+                                     over the listener fd\n",
+                                );
+                            }
                             unsafe {
                                 libc::close(fds.socketpair_parent);
                             }

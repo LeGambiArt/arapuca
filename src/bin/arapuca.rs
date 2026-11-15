@@ -537,9 +537,42 @@ fn main() {
                                     );
                                     unsafe { libc::_exit(1) };
                                 }
-                                // Keep listener_fd open — supervisor duplicates
-                                // it via pidfd_getfd. CLOEXEC ensures it closes
-                                // on exec.
+                                // Wait for the supervisor to duplicate the
+                                // listener fd BEFORE exec: the fd is CLOEXEC,
+                                // so an exec that wins the race against the
+                                // dup orphans the filter (every intercepted
+                                // syscall would return ENOSYS).
+                                // A supervisor that exited and one that is merely
+                                // slow both mean "no ack", but only the first is
+                                // hopeless; report them apart.
+                                match arapuca::unotify::wait_fd_ack_outcome(
+                                    fds.socketpair_parent,
+                                    5000,
+                                ) {
+                                    arapuca::unotify::AckOutcome::Acked => {}
+                                    outcome => {
+                                        let why = match outcome {
+                                            arapuca::unotify::AckOutcome::SupervisorGone => {
+                                                "exited before taking over the listener fd"
+                                            }
+                                            _ => "did not take over the listener fd within 5s",
+                                        };
+                                        if policy_active {
+                                            eprintln!("arapuca: unotify supervisor {why}");
+                                            eprintln!(
+                                                "arapuca: refusing to run without the unix \
+                                                 socket connect policy enforced"
+                                            );
+                                            unsafe {
+                                                libc::close(fds.socketpair_parent);
+                                                libc::_exit(125);
+                                            }
+                                        }
+                                        eprintln!("arapuca: unotify supervisor {why}");
+                                    }
+                                }
+                                // Keep listener_fd open — supervisor duplicated
+                                // it above. CLOEXEC ensures it closes on exec.
                                 unsafe {
                                     libc::close(fds.socketpair_parent);
                                 }
