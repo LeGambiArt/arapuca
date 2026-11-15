@@ -302,11 +302,13 @@ impl Sandbox for Linux {
             .as_deref()
             .or(cfg.network_proxy_socket.as_deref());
 
-        // When allowed_hosts is set, network namespace isolation is
-        // implicitly enabled (the proxy only makes sense inside netns).
+        // When allowed_hosts or a caller-supplied proxy socket is
+        // set, network namespace isolation is implicitly enabled
+        // (the in-namespace bridge only makes sense inside netns).
         let effective_use_netns = cfg.profile.use_netns
             || cfg.profile.allow_network_listeners
-            || connect_proxy_socket_local.is_some();
+            || connect_proxy_socket_local.is_some()
+            || cfg.network_proxy_socket.is_some();
 
         // ── DNS capture eligibility ────────────────────────────────
         let mount_ns_ok =

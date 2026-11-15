@@ -1351,3 +1351,77 @@ fn deny_network_with_allow_host_rejected() {
         "should reject combination, got: {stderr}"
     );
 }
+
+// ─── --proxy-socket tests ─────────────────────────────────────
+
+#[test]
+fn proxy_socket_flag_accepted_and_netns_active() {
+    // A dummy UDS listener stands in for the caller's relay: the
+    // bridge connects lazily, so accepting nothing is fine — the
+    // run succeeding proves the flag is wired through to a netns
+    // launch with the bridge pointed at the socket.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("relay.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let out = Command::new(arapuca_bin())
+        .args(["run", "--proxy-socket"])
+        .arg(&sock)
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(
+            // The loopback interface must be UP, not merely present:
+            // `ip link show lo` succeeds on a down interface too, so
+            // match the flag. `state UNKNOWN` is normal for lo, the
+            // flags list is what reports the link state.
+            "ip -o link show lo 2>/dev/null | grep -q '<LOOPBACK,UP' && echo LO_UP; \\
+             cat /proc/self/uid_map | head -1 > /dev/null && echo UIDMAP_OK",
+        )
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("LO_UP") && stdout.contains("UIDMAP_OK"),
+        "proxy-socket run should launch in a user+network namespace: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn proxy_socket_flag_validation() {
+    // Relative path rejected.
+    let out = Command::new(arapuca_bin())
+        .args(["run", "--proxy-socket", "relative/sock", "--", "/bin/true"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(125), "stderr: {stderr}");
+    assert!(stderr.contains("must be absolute"), "{stderr}");
+
+    // Colon in path rejected (bridge env encoding).
+    let out = Command::new(arapuca_bin())
+        .args(["run", "--proxy-socket", "/tmp/a:b.sock", "--", "/bin/true"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(125), "stderr: {stderr}");
+    assert!(stderr.contains("':'"), "{stderr}");
+
+    // Mutual exclusion with --allow-host.
+    let out = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--proxy-socket",
+            "/tmp/x.sock",
+            "--allow-host",
+            "example.com:443",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(125), "stderr: {stderr}");
+    assert!(stderr.contains("mutually exclusive"), "{stderr}");
+}
