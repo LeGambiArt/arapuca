@@ -1808,6 +1808,76 @@ fn read_exact_raw(fd: RawFd, buf: &mut [u8]) -> bool {
     true
 }
 
+/// Wait (bounded) for the supervisor's listener-handover ack on the
+/// parent end of the socketpair.
+///
+/// The supervisor writes one byte after successfully duplicating the
+/// listener fd via pidfd_getfd, and closes the socketpair on every
+/// path (ack, or death before the dup). Returns true only when the
+/// ack byte arrived; false on timeout, EOF (supervisor exited), or
+/// error. The caller decides between fail-closed (UDS connect policy
+/// active) and lenient continuation (audit-only features).
+pub fn wait_fd_ack(socketpair_parent: RawFd, timeout_ms: i32) -> bool {
+    wait_fd_ack_outcome(socketpair_parent, timeout_ms) == AckOutcome::Acked
+}
+
+/// How the listener-handover wait ended.
+///
+/// A timeout and a dead supervisor both mean "no ack", but they call
+/// for different reports: one is a stall that may still resolve, the
+/// other can never resolve. Collapsing them turns a supervisor that
+/// exited into a five-second silence followed by a message about
+/// timeouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// The supervisor duplicated the listener and acked.
+    Acked,
+    /// The socketpair reached EOF: the supervisor exited without
+    /// acking, so waiting longer cannot help.
+    SupervisorGone,
+    /// The deadline passed with the socketpair still open.
+    TimedOut,
+}
+
+/// Wait (bounded) for the supervisor's listener-handover ack, saying
+/// why the wait ended. See [`wait_fd_ack`].
+pub fn wait_fd_ack_outcome(socketpair_parent: RawFd, timeout_ms: i32) -> AckOutcome {
+    let mut pfd = libc::pollfd {
+        fd: socketpair_parent,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ret = loop {
+        // SAFETY: poll on a valid socketpair end.
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break ret;
+        }
+    };
+    if ret == 0 {
+        return AckOutcome::TimedOut;
+    }
+    if ret < 0 {
+        return AckOutcome::SupervisorGone;
+    }
+    // A supervisor that acks and then exits reports POLLIN together
+    // with POLLHUP, so a readable descriptor wins over the hangup: the
+    // byte is the ack, the hangup is just the close that follows it.
+    if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) & libc::POLLIN != 0 {
+        let mut ack = [0u8; 1];
+        // SAFETY: read of one byte from the polled socketpair end.
+        let n = unsafe { libc::read(socketpair_parent, ack.as_mut_ptr().cast(), 1) };
+        return match n {
+            1 => AckOutcome::Acked,
+            // EOF: the supervisor closed without acking, so no ack can
+            // follow.
+            0 => AckOutcome::SupervisorGone,
+            _ => AckOutcome::SupervisorGone,
+        };
+    }
+    AckOutcome::SupervisorGone
+}
+
 /// Write exactly `buf.len()` bytes, retrying on EINTR and short writes.
 pub fn write_all_raw(fd: RawFd, buf: &[u8]) -> bool {
     let mut offset = 0;
@@ -2360,20 +2430,36 @@ pub fn fork_unotify_supervisor(
                 libc::_exit(1);
             }
         }
-        unsafe { libc::close(sp_child) };
         let wrapper_pid = i32::from_ne_bytes(msg[..4].try_into().unwrap());
         let remote_fd = i32::from_ne_bytes(msg[4..].try_into().unwrap());
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, wrapper_pid, 0i32) } as i32;
         if pidfd < 0 {
             crate::wrapper::write_stderr("unotify supervisor: pidfd_open failed\n");
-            unsafe { libc::_exit(1) };
+            unsafe {
+                libc::close(sp_child);
+                libc::_exit(1);
+            }
         }
         let listener_fd =
             unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, remote_fd, 0u32) } as i32;
         unsafe { libc::close(pidfd) };
         if listener_fd < 0 {
             crate::wrapper::write_stderr("unotify supervisor: pidfd_getfd failed\n");
-            unsafe { libc::_exit(1) };
+            unsafe {
+                libc::close(sp_child);
+                libc::_exit(1);
+            }
+        }
+
+        // Acknowledge the handover BEFORE the wrapper execs: the
+        // listener fd is CLOEXEC on the wrapper side, so the dup must
+        // win the race against execve or the filter loses its only
+        // listener and every intercepted syscall returns ENOSYS. The
+        // wrapper blocks on this ack; a supervisor that dies before
+        // duplicating closes the socketpair without writing (EOF).
+        unsafe {
+            libc::write(sp_child, [1u8].as_ptr().cast(), 1);
+            libc::close(sp_child);
         }
 
         // Enter the supervisor loop (never returns).
@@ -3020,6 +3106,92 @@ mod tests {
                 .any(|i| i.code == BPF_RET | BPF_K && i.k == libc::SECCOMP_RET_USER_NOTIF),
             "kill-arch BPF should still contain SECCOMP_RET_USER_NOTIF"
         );
+    }
+
+    #[test]
+    fn wait_fd_ack_detects_ack_eof_and_timeout() {
+        // Ack: the supervisor writes one byte then closes.
+        let mut sv = [0i32; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    sv.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        // SAFETY: write one ack byte on the child end and close it.
+        unsafe {
+            libc::write(sv[1], [1u8].as_ptr().cast(), 1);
+            libc::close(sv[1]);
+        }
+        assert!(wait_fd_ack(sv[0], 1000));
+        // The ack arrives with the peer's close, so a readable
+        // descriptor must win over the hangup.
+        assert_eq!(
+            wait_fd_ack_outcome(sv[0], 1000),
+            AckOutcome::SupervisorGone,
+            "the byte was already consumed by the call above"
+        );
+        // SAFETY: cleanup of the parent end.
+        unsafe { libc::close(sv[0]) };
+
+        // EOF: the supervisor closes without acking.
+        let mut sv = [0i32; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    sv.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        // SAFETY: close the child end without writing.
+        unsafe { libc::close(sv[1]) };
+        assert!(!wait_fd_ack(sv[0], 1000));
+        assert_eq!(
+            wait_fd_ack_outcome(sv[0], 1000),
+            AckOutcome::SupervisorGone,
+            "EOF must not be reported as a timeout"
+        );
+        // SAFETY: cleanup of the parent end.
+        unsafe { libc::close(sv[0]) };
+
+        // Timeout: nothing arrives.
+        let mut sv = [0i32; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    sv.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let start = std::time::Instant::now();
+        assert_eq!(wait_fd_ack_outcome(sv[0], 150), AckOutcome::TimedOut);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(140),
+            "the outcome variant must wait out the deadline"
+        );
+        assert!(!wait_fd_ack(sv[0], 150));
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(140),
+            "timeout should elapse"
+        );
+        // SAFETY: cleanup of both ends.
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
     }
 
     #[test]
