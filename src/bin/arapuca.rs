@@ -747,6 +747,10 @@ fn run_subcommand(args: &[String]) {
     let mut tty = false;
     #[cfg(target_os = "linux")]
     let mut allowed_hosts: Vec<arapuca::bridge::AllowedHost> = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut proxy_socket: Option<PathBuf> = None;
+    #[cfg(not(target_os = "linux"))]
+    let proxy_socket: Option<PathBuf> = None;
     let mut deny_network = false;
     let mut no_pid_ns = false;
     let mut audit_files = false;
@@ -785,6 +789,10 @@ fn run_subcommand(args: &[String]) {
             eprintln!("  --audit-files      emit file access and process spawn audit events");
             eprintln!("  --seccomp-debug    log blocked syscalls to stderr instead of killing");
             eprintln!("  --audit-network    emit network connection audit events");
+            eprintln!(
+                "  --proxy-socket P   relay sandbox loopback TCP through the Unix socket at P \\
+                 (implies a network namespace)"
+            );
             eprintln!(
                 "  --allow-proxy-env  forward HTTP(S)_PROXY/ALL_PROXY/NO_PROXY from the caller's env"
             );
@@ -975,6 +983,31 @@ fn run_subcommand(args: &[String]) {
                 {
                     let _ = spec;
                     eprintln!("arapuca run: --allow-host requires Linux (network namespaces)");
+                    std::process::exit(125);
+                }
+            }
+            "--proxy-socket" => {
+                #[cfg(target_os = "linux")]
+                {
+                    i += 1;
+                    let path = flag_args.get(i).unwrap_or_else(|| {
+                        eprintln!("arapuca run: --proxy-socket requires a path");
+                        std::process::exit(125);
+                    });
+                    let path = PathBuf::from(path);
+                    if !path.is_absolute() {
+                        eprintln!("arapuca run: --proxy-socket path must be absolute: {path:?}");
+                        std::process::exit(125);
+                    }
+                    if path.to_string_lossy().contains(':') {
+                        eprintln!("arapuca run: --proxy-socket path must not contain ':'");
+                        std::process::exit(125);
+                    }
+                    proxy_socket = Some(path);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    eprintln!("arapuca run: --proxy-socket requires Linux (network namespaces)");
                     std::process::exit(125);
                 }
             }
@@ -1183,7 +1216,21 @@ fn run_subcommand(args: &[String]) {
         std::process::exit(125);
     });
 
-    let use_netns = connect_proxy_socket.is_some() || deny_network || allow_network_listeners;
+    #[cfg(target_os = "linux")]
+    if proxy_socket.is_some() && !allowed_hosts.is_empty() {
+        eprintln!(
+            "arapuca run: --proxy-socket and --allow-host are mutually exclusive \
+             (both need the in-namespace proxy bridge)"
+        );
+        std::process::exit(125);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = &proxy_socket;
+
+    let use_netns = connect_proxy_socket.is_some()
+        || deny_network
+        || allow_network_listeners
+        || proxy_socket.is_some();
     let profile = arapuca::Profile {
         read_paths,
         write_paths,
@@ -1251,7 +1298,7 @@ fn run_subcommand(args: &[String]) {
         extra_fds: Vec::new(),
         #[cfg(unix)]
         tty,
-        network_proxy_socket: connect_proxy_socket.clone(),
+        network_proxy_socket: proxy_socket.clone().or(connect_proxy_socket.clone()),
         #[cfg(target_os = "linux")]
         allowed_hosts: Vec::new(),
         env: user_env,
