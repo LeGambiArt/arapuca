@@ -42,6 +42,23 @@ fn python3_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+fn yama_scope() -> u32 {
+    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Yama scope 3 denies ptrace unconditionally — even a capful
+/// supervisor inside a user namespace cannot inspect the target, so
+/// no unotify-dependent test can run. Scopes 0-2 work under the
+/// netns tests' user namespace (caps bypass scope 2).
+fn yama_scope_is_absolute() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .map(|s| s.trim().parse::<u32>().unwrap_or(0) >= 3)
+        .unwrap_or(false)
+}
+
 /// Run a command in the sandbox with the UDS policy active (inside a
 /// user+network namespace so the supervisor can inspect the target on
 /// Yama hosts). `extra_args` carries policy-specific flags.
@@ -133,6 +150,10 @@ fn uds_policy_allows_ordinary_socket_and_data_flows() {
         eprintln!("skipping: requires unshare userns and python3");
         return;
     }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let mut listener = EchoListener::spawn(dir.path(), "allowed.sock");
     let script = format!(
@@ -162,6 +183,10 @@ print("ALLOW_OK")
 fn uds_policy_denies_deny_root_with_eacces() {
     if !netns_root_available() || !python3_available() {
         eprintln!("skipping: requires unshare userns and python3");
+        return;
+    }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -202,6 +227,10 @@ fn uds_policy_denies_non_dumpable_target() {
         eprintln!("skipping: requires unshare userns and python3");
         return;
     }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let mut listener = EchoListener::spawn(dir.path(), "priv.sock");
     let script = format!(
@@ -240,6 +269,10 @@ fn uds_policy_sibling_writer_never_reaches_denied_peer() {
     // nothing.
     if !netns_root_available() || !python3_available() {
         eprintln!("skipping: requires unshare userns and python3");
+        return;
+    }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -309,6 +342,10 @@ fn uds_policy_buffer_rewrite_race_connects_benign_socket_only() {
     // never sees a connection.
     if !netns_root_available() || !python3_available() {
         eprintln!("skipping: requires unshare userns and python3");
+        return;
+    }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -408,6 +445,10 @@ fn uds_policy_unsupported_family_denies_without_killing_supervisor() {
         eprintln!("skipping: requires unshare userns and python3");
         return;
     }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let mut listener = EchoListener::spawn(dir.path(), "after.sock");
     let script = format!(
@@ -493,6 +534,10 @@ fn uds_policy_broker_inet_allows_bridge_dns() {
         eprintln!("skipping: requires unshare userns and python3");
         return;
     }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
+        return;
+    }
     let script = r#"
 import socket
 u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -519,6 +564,10 @@ fn uds_policy_broker_inet_denies_nonbridge_before_dial() {
     // the local connection; with it, the broker denies.
     if !netns_root_available() || !python3_available() {
         eprintln!("skipping: requires unshare userns and python3");
+        return;
+    }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
         return;
     }
     let script = r#"
@@ -637,6 +686,10 @@ fn run_selfexec(unotify_config: Option<&str>, script: &str) -> (Option<i32>, Str
 fn uds_policy_selfexec_path_brokers_connects() {
     if !python3_available() {
         eprintln!("skipping: requires python3");
+        return;
+    }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -962,6 +1015,10 @@ fn uds_policy_worker_thread_connects_brokered() {
         eprintln!("skipping: requires unshare userns and python3");
         return;
     }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
 
     // Allowed socket, connected FROM a worker thread: must work
@@ -1194,5 +1251,146 @@ os.execv("/bin/sh", ["/bin/sh", "-c", "printf INHERITED >&3; exit 0"])
         "the exec'd child must write through the delivered socket \\
          (got {n} bytes; exit={:?}, stderr: {stderr})",
         out.status.code()
+    );
+}
+
+// ─── Target capability scrub ─────────────────────────────────────
+
+#[test]
+fn target_is_capless_in_userns_at_exec() {
+    // Under `unshare --user --map-root-user` the sandboxed target
+    // would otherwise retain a full capability set in the user
+    // namespace across exec — which bypasses PR_SET_DUMPABLE=0 and
+    // Yama on every same-namespace process, including the unotify
+    // supervisor whose allowlist permits connect(). The wrapper
+    // scrubs the grant (SECBIT_NOROOT) before exec: the target must
+    // report no effective capabilities.
+    if !netns_root_available() || !python3_available() {
+        eprintln!("skipping: requires unshare userns and python3");
+        return;
+    }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
+        return;
+    }
+    let out = Command::new("unshare")
+        .args(["--user", "--net", "--map-root-user", "--"])
+        .arg(arapuca_bin())
+        .args([
+            "run",
+            "--deny-network",
+            "--no-pid-ns",
+            "--seccomp",
+            "baseline",
+            "--",
+        ])
+        .arg("/usr/bin/python3")
+        .arg("-c")
+        .arg(
+            r#"
+import re
+status = open("/proc/self/status").read()
+cap_eff = re.search(r"^CapEff:\s*(\w+)", status, re.M).group(1)
+print("CAP_EFF", cap_eff)
+assert int(cap_eff, 16) == 0, cap_eff
+"#,
+        )
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("CAP_EFF 0"),
+        "target must be capless at exec: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn supervisor_mem_not_writable_by_capless_target() {
+    // The companion assertion to the scrub: with --no-pid-ns and a
+    // /proc-readable (baseline) sandbox, the target can enumerate
+    // the arapuca processes (supervisor, bridge, relay) in /proc —
+    // pidns does NOT hide them — but with the target capless and
+    // the helpers non-dumpable, opening their /proc/<pid>/mem must
+    // fail EACCES. Only meaningful when a supervisor actually runs
+    // (Yama ptrace_scope <= 1, or the audit path forks one inside
+    // the userns); at higher scopes the run fail-closes earlier and
+    // the test degrades to asserting the target is capless.
+    if !netns_root_available() || !python3_available() {
+        eprintln!("skipping: requires unshare userns and python3");
+        return;
+    }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
+        return;
+    }
+    let yama_scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let script = r#"
+import os, re, errno
+
+status = open("/proc/self/status").read()
+cap_eff = int(re.search(r"^CapEff:\s*(\w+)", status, re.M).group(1), 16)
+assert cap_eff == 0, cap_eff
+
+checked = 0
+denied = 0
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    try:
+        comm = open(f"/proc/{pid}/comm").read().strip()
+    except OSError:
+        continue
+    if "arapuca" not in comm:
+        continue
+    try:
+        fd = os.open(f"/proc/{pid}/mem", os.O_RDWR)
+        os.close(fd)
+        print("MEM_OPEN_OK", pid, comm)
+    except OSError as e:
+        assert e.errno == errno.EACCES, (pid, comm, e.errno)
+        denied += 1
+    checked += 1
+print("ARAPUCA_PROCS", checked, "DENIED", denied)
+"#;
+    let out = Command::new("unshare")
+        .args(["--user", "--net", "--map-root-user", "--"])
+        .arg(arapuca_bin())
+        .args([
+            "run",
+            "--deny-network",
+            "--no-pid-ns",
+            "--seccomp",
+            "baseline",
+            "--",
+        ])
+        .arg("/usr/bin/python3")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if yama_scope >= 2 {
+        // No supervisor can run (launch fail-closes under the
+        // policy; audit-only paths skip it): the capless assertion
+        // is all that can hold here.
+        eprintln!("skipping mem assertions at yama scope {yama_scope}");
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "script must complete: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("MEM_OPEN_OK"),
+        "no arapuca process's mem may be writable by the target: {stdout}"
+    );
+    assert!(
+        stdout.contains("ARAPUCA_PROCS"),
+        "must have scanned /proc: {stdout}\nstderr: {stderr}"
     );
 }

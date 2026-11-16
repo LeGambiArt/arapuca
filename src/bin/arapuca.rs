@@ -710,6 +710,17 @@ fn main() {
                 .chain(std::iter::once(std::ptr::null()))
                 .collect();
 
+            // Scrub root-derived capabilities (SECBIT_NOROOT): the
+            // target must be capless in the user namespace, or a
+            // cap-bearing target can bypass PR_SET_DUMPABLE and Yama
+            // on every same-namespace process — including the
+            // unotify supervisor.
+            #[cfg(target_os = "linux")]
+            if let Err(e) = arapuca::wrapper::scrub_capabilities_for_exec() {
+                eprintln!("arapuca: {e}");
+                std::process::exit(1);
+            }
+
             let ret = libc::execve(c_cmd.as_ptr(), argv.as_ptr(), envp.as_ptr());
             if ret == -1 {
                 eprintln!("arapuca: exec {}: {}", cmd, std::io::Error::last_os_error());
