@@ -198,7 +198,7 @@ arapuca run \
 | `--timeout N` | Kill after N seconds |
 | `--memory N` | Memory limit in MB |
 | `--cpus N` | CPU percentage (200 = 2 cores) |
-| `--pids N` | Max number of PIDs |
+| `--pids N` | Max processes in the run's cgroup. Helpers count against it: with `--deny-privileged-unix-sockets` the supervisor takes one slot, so `--pids 8` leaves 7 for the target and its children. |
 | `--task-id NAME` | Identifier for cgroup and audit |
 | `--allow-host H:P` | Allow HTTPS to host:port or `*.domain:port` via CONNECT proxy (Linux) |
 | `--deny-network` | Block all network; capture DNS queries as audit events (Linux) |
@@ -230,7 +230,8 @@ policy below is active.
 # Deny connect() to well-known privileged daemon sockets (docker,
 # podman system, containerd, CRI-O, dbus system bus, libvirt,
 # systemd manager, LXD, snapd) while ordinary Unix sockets keep
-# working. Requires a user namespace — any network-namespace mode
+# working. Plain runs enforce at Yama ptrace_scope 0-1; a user
+# namespace (any network-namespace mode provides one) extends
 # (--deny-network, --allow-host, --allow-network-listeners,
 # --proxy-socket) provides one.
 arapuca run --deny-privileged-unix-sockets -- cmd
@@ -242,15 +243,46 @@ arapuca run --deny-privileged-unix-sockets \
 ```
 
 The policy brokers every `connect()` through a seccomp user-notify
-supervisor: the peer actually connected to is verified after the
-kernel resolves it, and the verified socket is what the sandboxed
-process receives. Denied connects return `EACCES` and emit a
-`UnixSocketBlocked` audit event. Rootless daemon sockets under
-`/run/user/<uid>/` (e.g. rootless podman) are deliberately not
-affected. Requires kernel ≥ 5.9 and a user namespace (Yama
-`ptrace_scope=1` hosts need one); when the policy is requested but
-cannot be enforced, the launch fails rather than running unenforced.
-`--allow-unix-socket-connect` opts out.
+supervisor running as the sandbox's PARENT: the launcher spawns an
+internal supervisor-mode process which forks the wrapper, so the
+supervisor inspects its own descendant — permitted by Yama
+`ptrace_scope` 0 and 1 with no user namespace required. The peer
+actually connected to is verified after the kernel resolves it, and
+the verified socket is what the sandboxed process receives. Denied
+connects return `EACCES` and emit a `UnixSocketBlocked` audit
+event. Rootless daemon sockets under `/run/user/<uid>/` (e.g.
+rootless podman) are deliberately not affected. Requires kernel
+≥ 5.9; enforced on plain runs at Yama scopes 0-1, inside
+network-namespace modes at scopes 0-2 (the supervisor holds user
+namespace capabilities there), and refused fail-closed at scope 3
+(which denies all ptrace unconditionally) or when the kernel lacks
+the needed support. When the policy is requested but cannot be
+enforced, the launch fails rather than running unenforced.
+`--allow-unix-socket-connect` opts out. Supervisor death kills the
+sandbox (PDEATHSIG), not just its intercepted syscalls.
+
+Two behavior notes on brokered connects: the delivered socket is a new
+descriptor, so peers that identify clients by credentials
+(`SO_PEERCRED`, `SO_PEERPIDFD`) see the supervisor's pid, and socket
+options set before `connect()` do not carry over (the protocol does).
+And plain launches by host root now run the target with
+`SECBIT_NOROOT` set: a root target is capless across exec.
+
+The supervisor serves connects until the wrapper exits, not until the
+last intercepted task does. Descendants a target leaves behind lose
+brokered connects once the wrapper is gone: their `connect()` calls
+fail closed, and the launcher's group kill reclaims them. Serving
+longer would leave the supervisor waiting on processes the pidfd and
+the timeout no longer track, which is the wedge the loop no longer
+creates.
+
+**Datagram gap**: the policy brokers `connect()` only. An
+unconnected `SOCK_DGRAM` socket can still `sendto()`/`sendmsg()` a
+pathname peer without going through the broker — the built-in deny
+roots are all `SOCK_STREAM` daemons, so practical exposure is
+limited to user-supplied deny roots that name datagram sockets.
+Until datagram senders are covered, treat such roots as best-effort
+for `SOCK_DGRAM` peers.
 
 ### Micro-VM (requires `microvm` feature)
 
