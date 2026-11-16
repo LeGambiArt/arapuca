@@ -202,6 +202,10 @@ arapuca run \
 | `--task-id NAME` | Identifier for cgroup and audit |
 | `--allow-host H:P` | Allow HTTPS to host:port or `*.domain:port` via CONNECT proxy (Linux) |
 | `--deny-network` | Block all network; capture DNS queries as audit events (Linux) |
+| `--proxy-socket P` | Run in a network namespace whose loopback is bridged to the Unix socket at `P` (Linux) |
+| `--deny-privileged-unix-sockets` | Deny `connect()` to privileged daemon sockets — docker, podman system, dbus, libvirt, ... (Linux) |
+| `--unix-socket-deny-root PATH` | Add a deny root for the unix socket policy (Linux) |
+| `--allow-unix-socket-connect` | Disable the unix socket connect policy |
 | `--allow-network-listeners` | Allow TCP bind/inbound; on Linux confines listeners to an isolated network namespace. On macOS, Seatbelt cannot reliably confine listeners to loopback, so use only with trusted programs. |
 | `--seccomp MODE` | Seccomp profile: `strict` (default) or `baseline` |
 | `--audit-files` | Emit file access and process spawn audit events (Linux) |
@@ -210,6 +214,43 @@ arapuca run \
 | `--no-pid-ns` | Disable PID namespace isolation |
 | `--lpac` | Run as a Less Privileged AppContainer; may break binaries needing registry/DLL access outside the LPAC allowlist (Windows) |
 | `-t, --tty` | Allocate a PTY for interactive programs |
+
+### Unix socket connect policy (Linux)
+
+Landlock, seccomp, and network namespaces do not confine `connect()`
+to **pathname Unix sockets**. On a host where the invoking user can
+reach a privileged daemon socket — being in the `docker` group is the
+common case — a sandboxed process can talk to the root-owned daemon
+and make it do privileged work (run containers, mount the host
+filesystem) outside every arapuca layer. On such hosts, plain
+sandboxing provides **no containment** against that daemon unless the
+policy below is active.
+
+```bash
+# Deny connect() to well-known privileged daemon sockets (docker,
+# podman system, containerd, CRI-O, dbus system bus, libvirt,
+# systemd manager, LXD, snapd) while ordinary Unix sockets keep
+# working. Requires a user namespace — any network-namespace mode
+# (--deny-network, --allow-host, --allow-network-listeners,
+# --proxy-socket) provides one.
+arapuca run --deny-privileged-unix-sockets -- cmd
+
+# Extend the deny list with your own roots (exact path or
+# beneath-directory):
+arapuca run --deny-privileged-unix-sockets \
+  --unix-socket-deny-root /run/my-daemon -- cmd
+```
+
+The policy brokers every `connect()` through a seccomp user-notify
+supervisor: the peer actually connected to is verified after the
+kernel resolves it, and the verified socket is what the sandboxed
+process receives. Denied connects return `EACCES` and emit a
+`UnixSocketBlocked` audit event. Rootless daemon sockets under
+`/run/user/<uid>/` (e.g. rootless podman) are deliberately not
+affected. Requires kernel ≥ 5.9 and a user namespace (Yama
+`ptrace_scope=1` hosts need one); when the policy is requested but
+cannot be enforced, the launch fails rather than running unenforced.
+`--allow-unix-socket-connect` opts out.
 
 ### Micro-VM (requires `microvm` feature)
 
