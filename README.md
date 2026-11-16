@@ -202,6 +202,7 @@ arapuca run \
 | `--task-id NAME` | Identifier for cgroup and audit |
 | `--allow-host H:P` | Allow HTTPS to host:port or `*.domain:port` via CONNECT proxy (Linux) |
 | `--deny-network` | Block all network; capture DNS queries as audit events (Linux) |
+| `--userns` | Run under a user namespace (current uid/gid mapped 1:1, capless, host network shared; isolation only — Linux) |
 | `--proxy-socket P` | Run in a network namespace whose loopback is bridged to the Unix socket at `P` (Linux) |
 | `--deny-privileged-unix-sockets` | Deny `connect()` to privileged daemon sockets — docker, podman system, dbus, libvirt, ... (Linux) |
 | `--unix-socket-deny-root PATH` | Add a deny root for the unix socket policy (Linux) |
@@ -283,6 +284,52 @@ roots are all `SOCK_STREAM` daemons, so practical exposure is
 limited to user-supplied deny roots that name datagram sockets.
 Until datagram senders are covered, treat such roots as best-effort
 for `SOCK_DGRAM` peers.
+
+### User namespace isolation (`--userns`, Linux)
+
+Run the target under a user namespace that maps the invoking
+uid/gid 1:1 (`unshare --user --map-current-user`): the target is
+**capless** (mapping a non-root uid clears the namespace
+capabilities across `exec`), the **host network is fully shared**
+(no network namespace), and no other namespace is created.
+
+```bash
+arapuca run --userns -- cmd
+```
+
+This is an isolation-hardening layer, not an enforcement
+mechanism. It does not change Yama ptrace coverage (plain runs
+stay enforceable by the unix socket connect policy only at
+`ptrace_scope` 0-1) and carries no policy of its own. The
+combination rules fail closed: the network-namespace modes
+(`--deny-network`, `--allow-host`, `--allow-network-listeners`,
+`--proxy-socket`) already imply a root-mapped user namespace, so
+`--userns` is exclusive with all of them and with PID namespaces.
+
+Observable behavior inside the namespace:
+
+- `/proc/self/uid_map` and `/proc/self/gid_map` exist with a
+  single 1:1 entry; `getuid()`/`getgid()` are unchanged.
+- Root-owned files whose owner is unmapped appear owned by the
+  overflow uid/gid (`65534`) — cosmetic, not access control.
+- **Supplementary groups are not dropped.** The kernel keeps the
+  real gids; userspace shows every unmapped one as `65534`, and
+  group-gated DAC access (e.g. a `docker`-group socket) still
+  works inside the namespace. If a socket must not be reachable,
+  use `--deny-privileged-unix-sockets` — that policy denies the
+  `connect()` itself, regardless of DAC.
+- On hosts that disable unprivileged user namespaces, the launch
+  **degrades loudly** (stderr notice + `UserNamespace` audit skip)
+  and continues without the namespace. This fallback exists only
+  because the layer is not load-bearing for any policy; if
+  `--userns` ever becomes load-bearing (policy or otherwise), the
+  explicit request must fail closed instead.
+
+Do not confuse this with the root-mapped namespaces the
+network-namespace modes create (`--map-root-user`). Those keep a
+capful supervisor inside the namespace by design; `--userns`
+deliberately maps the current uid so nothing inside — supervisor,
+wrapper, or target — ever holds capabilities there.
 
 ### Micro-VM (requires `microvm` feature)
 
