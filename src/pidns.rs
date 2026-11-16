@@ -121,13 +121,16 @@ pub fn fork_into_pidns(
     };
     unsafe { libc::close(pid_pipe[1]) };
 
-    // This path never returns.
+    // This path never returns. pipe_fds[1] (liveness write end) is
+    // passed so the relay's fd sweep keeps it: it closes at _exit,
+    // which is the child's parent-death signal.
     parent_relay(
         child_pid,
         audit_fd,
         dns_audit_fd,
         unotify_audit_fd,
         pid_report_fd,
+        pipe_fds[1],
     );
 }
 
@@ -164,7 +167,51 @@ fn parent_relay(
     dns_audit_fd: Option<i32>,
     unotify_audit_fd: Option<i32>,
     pid_report_fd: Option<i32>,
+    liveness_fd: i32,
 ) -> ! {
+    // 0. Harden the relay. It is forked from the (possibly
+    // capability-bearing, --map-root-user) wrapper before the
+    // wrapper closes its own descriptors, so it inherits both caps
+    // and stray fds. A capful, /proc-reachable relay is a
+    // memory-corruption pivot (capabilities bypass dumpability and
+    // Yama); the relay never execs and needs no capabilities.
+    // SAFETY: prctl with scalar arguments.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+        write_stderr("arapuca: pidns: relay PR_SET_DUMPABLE failed\n");
+        unsafe { libc::_exit(1) };
+    }
+    // SAFETY: prctl with scalar arguments.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64) } != 0 {
+        write_stderr("arapuca: pidns: relay PR_SET_NO_NEW_PRIVS failed\n");
+        unsafe { libc::_exit(1) };
+    }
+    if let Err(e) = crate::wrapper::drop_capabilities() {
+        write_stderr(&format!("arapuca: pidns: relay cap drop: {e}\n"));
+        unsafe { libc::_exit(1) };
+    }
+    // Close every inherited fd the relay does not need: it must only
+    // waitpid, forward signals, and write the pid report. The
+    // pass-through fds below are used or closed explicitly in steps
+    // 1b-2. A blind close loop (not /proc/self/fd enumeration —
+    // the relay inherits the wrapper's Landlock, which denies /proc)
+    // bounded by RLIMIT_NOFILE.
+    let keep: [i32; 5] = [
+        pid_report_fd.unwrap_or(-1),
+        audit_fd.unwrap_or(-1),
+        dns_audit_fd.unwrap_or(-1),
+        unotify_audit_fd.unwrap_or(-1),
+        liveness_fd,
+    ];
+    // close_range with gap awareness (same shape as
+    // bridge::close_fds_except): a blind loop over RLIMIT_NOFILE is
+    // unbounded — with LimitNOFILE=infinity that is ~1e9 close()
+    // calls before the pid report, stalling the launch for minutes,
+    // and a soft limit above i32::MAX turns the bound negative and
+    // closes nothing at all.
+    // SAFETY: the relay owns its descriptor table at this point (post
+    // fork, pre exec); the keep set names the only fds that survive.
+    unsafe { crate::bridge::close_fds_except(&keep) };
+
     // 1. Hold a pidfd to prevent the kernel from recycling the
     // child's PID while the orchestrator reads the report pipe and
     // opens its own pidfd. Opened BEFORE publishing the PID so the

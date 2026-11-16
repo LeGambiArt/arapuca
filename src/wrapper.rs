@@ -469,3 +469,54 @@ mod securebits_tests {
         assert!(root_grant_absent());
     }
 }
+
+/// Drop all capabilities (permitted, effective, inheritable) for the
+/// calling process.
+///
+/// Used by internal helper children (pidns relay, bridge, DNS,
+/// connect proxy) forked from a capability-bearing wrapper in
+/// `--map-root-user` modes: a capful, `/proc`-reachable helper is a
+/// memory-corruption pivot for anything that can open its
+/// `/proc/<pid>/mem` — capabilities bypass `PR_SET_DUMPABLE=0` and
+/// Yama. These helpers never exec and never need capabilities.
+///
+/// Dropping is unprivileged (only raising requires CAP_SETPCAP);
+/// for an already-capless process this is a no-op.
+#[cfg(target_os = "linux")]
+pub fn drop_capabilities() -> Result<(), String> {
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let mut hdr = CapHeader {
+        version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+        pid: 0,
+    };
+    // All-zero sets: drop everything.
+    let data = [CapData::default(); 2];
+    // SAFETY: capset with stack structs of the ABI shapes from
+    // include/uapi/linux/capability.h; pid 0 means "this process".
+    let ret = unsafe { libc::syscall(libc::SYS_capset, &mut hdr as *mut CapHeader, data.as_ptr()) };
+    if ret != 0 {
+        return Err(format!("capset: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod capdrop_tests {
+    use super::*;
+
+    #[test]
+    fn drop_capabilities_succeeds_unprivileged() {
+        drop_capabilities().expect("capset drop must succeed");
+    }
+}

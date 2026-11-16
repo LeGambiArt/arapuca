@@ -426,6 +426,14 @@ pub fn fork_bridge(
             unsafe { libc::_exit(1) };
         }
 
+        // The bridge never execs and needs no capabilities; drop
+        // them so a cap-bearing helper cannot be pivoted through
+        // /proc/<pid>/mem (capabilities bypass dumpability).
+        if let Err(e) = crate::wrapper::drop_capabilities() {
+            child_stderr(&format!("bridge: cap drop: {e}\n"));
+            unsafe { libc::_exit(1) };
+        }
+
         #[cfg(seccomp_supported)]
         if let Err(e) = apply_bridge_seccomp(seccomp_debug) {
             child_stderr(&format!("bridge: seccomp: {e}\n"));
@@ -1842,6 +1850,14 @@ pub fn fork_connect_proxy(
 
         // SAFETY: prctl with PR_SET_DUMPABLE.
         if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+
+        // The proxy never execs and needs no capabilities; drop
+        // them so a cap-bearing helper cannot be pivoted through
+        // /proc/<pid>/mem (capabilities bypass dumpability).
+        if let Err(e) = crate::wrapper::drop_capabilities() {
+            crate::wrapper::write_stderr(&format!("connect proxy: cap drop: {e}\n"));
             unsafe { libc::_exit(1) };
         }
 
