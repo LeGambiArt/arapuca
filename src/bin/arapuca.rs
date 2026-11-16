@@ -779,6 +779,10 @@ fn run_subcommand(args: &[String]) {
     #[cfg(not(target_os = "linux"))]
     let proxy_socket: Option<PathBuf> = None;
     let mut deny_network = false;
+    #[cfg(target_os = "linux")]
+    let mut userns = false;
+    #[cfg(not(target_os = "linux"))]
+    let userns = false;
     let mut no_pid_ns = false;
     let mut audit_files = false;
     #[allow(unused_mut, unused_variables)]
@@ -812,6 +816,10 @@ fn run_subcommand(args: &[String]) {
             eprintln!("  --allow-host H:P   allow HTTPS to host:port or *.domain:port");
             eprintln!(
                 "  --deny-network     block all network; capture DNS queries as audit events"
+            );
+            eprintln!(
+                "  --userns           run under a user namespace (current uid/gid \
+                 mapped 1:1); isolation only, host network shared"
             );
             eprintln!("  --audit-files      emit file access and process spawn audit events");
             eprintln!("  --seccomp-debug    log blocked syscalls to stderr instead of killing");
@@ -1046,6 +1054,17 @@ fn run_subcommand(args: &[String]) {
                      network denial on this platform is handled by the native sandbox"
                 );
             }
+            "--userns" => {
+                #[cfg(target_os = "linux")]
+                {
+                    userns = true;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    eprintln!("arapuca run: --userns requires Linux");
+                    std::process::exit(125);
+                }
+            }
             #[cfg(unix)]
             "-t" | "--tty" => {
                 tty = true;
@@ -1158,6 +1177,30 @@ fn run_subcommand(args: &[String]) {
         eprintln!("arapuca run: {e}");
         std::process::exit(125);
     }
+    #[cfg(target_os = "linux")]
+    if userns
+        && (deny_network
+            || allow_network_listeners
+            || proxy_socket.is_some()
+            || !allowed_hosts.is_empty())
+    {
+        eprintln!(
+            "arapuca run: --userns is exclusive with the network-namespace modes \
+             (--deny-network, --allow-host, --allow-network-listeners, --proxy-socket)"
+        );
+        std::process::exit(125);
+    }
+    #[cfg(target_os = "linux")]
+    if userns && !arapuca::netns::userns_current_user_available() {
+        // Loud fallback notice: the launcher proceeds without the
+        // namespace (warning + audit skip on its side); the run is
+        // not failed because --userns is not load-bearing for any
+        // policy. If that ever changes, this must fail closed.
+        eprintln!(
+            "arapuca run: --userns requested but user namespaces are \
+             unavailable on this host; continuing without the user namespace"
+        );
+    }
     if deny_network && allow_network_listeners {
         eprintln!(
             "arapuca run: --deny-network and --allow-network-listeners are mutually exclusive"
@@ -1267,6 +1310,7 @@ fn run_subcommand(args: &[String]) {
         allow_exec: true,
         use_netns,
         use_pidns: use_netns && !no_pid_ns,
+        use_userns: userns,
         dns_capture: deny_network,
         lpac,
         seccomp_profile,

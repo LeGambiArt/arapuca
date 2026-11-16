@@ -54,6 +54,7 @@ impl Linux {
 impl Sandbox for Linux {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
         cfg.profile.validate_unix_socket_policy()?;
+        cfg.profile.validate_userns()?;
         // Validate task ID.
         crate::sanitize_task_id(&cfg.task_id)?;
 
@@ -362,6 +363,39 @@ impl Sandbox for Linux {
             || connect_proxy_socket_local.is_some()
             || cfg.network_proxy_socket.is_some();
 
+        // ── User namespace (--userns) ────────────────────────────
+        // Isolation-hardening only; never part of `effective_use_netns`
+        // or any bridge/DNS eligibility. A requested-but-unavailable
+        // namespace degrades loudly (warning + audit skip) rather than
+        // failing the run: the flag is not load-bearing for any
+        // policy — the unix socket connect policy enforces at Yama
+        // scopes 0/1 without a namespace. If that ever changes, this
+        // fallback must become fail-closed.
+        if cfg.profile.use_userns && effective_use_netns {
+            return Err(crate::Error::Validation(
+                "--userns is exclusive with the network-namespace modes \
+                 (network proxy / allowed hosts imply one)"
+                    .into(),
+            ));
+        }
+        let userns_active = cfg.profile.use_userns && crate::netns::userns_current_user_available();
+        if cfg.profile.use_userns && !userns_active {
+            log::warn!(
+                "--userns requested but user namespaces are unavailable \
+                 on this host; continuing without the user namespace"
+            );
+            if let Some(ref ctx) = audit_ctx {
+                ctx.emit(AuditEvent::LayerSkipped {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::UserNamespace,
+                    reason: SkipReason::PartialFailure(
+                        "user namespaces unavailable on this host".into(),
+                    ),
+                })?;
+            }
+            skipped_layers.push(SandboxLayer::UserNamespace);
+        }
+
         // ── DNS capture eligibility ────────────────────────────────
         let mount_ns_ok =
             cfg.profile.dns_capture && effective_use_netns && crate::netns::mount_ns_available();
@@ -412,6 +446,30 @@ impl Sandbox for Linux {
                 })?;
             }
             skipped_layers.push(SandboxLayer::NetworkNamespace);
+            c
+        } else if userns_active {
+            // Standalone user namespace with the current uid/gid
+            // mapped 1:1: capless target, host network shared, no
+            // other namespace. Same unshare exec shape as the netns
+            // modes (in-place exec, no extra process for the cgroup
+            // pids budget).
+            let mut c = Command::new("unshare");
+            c.args(["--user", "--map-current-user", "--"]);
+            c.arg(&actual_cmd);
+            c.args(&actual_args);
+            if let Some(ref ctx) = audit_ctx {
+                ctx.emit(AuditEvent::LayerSkipped {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::NetworkNamespace,
+                    reason: SkipReason::NotConfigured,
+                })?;
+                ctx.emit(AuditEvent::LayerApplied {
+                    timestamp: ctx.timestamp(),
+                    layer: SandboxLayer::UserNamespace,
+                    detail: None,
+                })?;
+            }
+            applied_layers.push(SandboxLayer::UserNamespace);
             c
         } else {
             let mut c = Command::new(&actual_cmd);

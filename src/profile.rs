@@ -149,6 +149,18 @@ pub struct Profile {
     /// (provided by `use_netns`, or added automatically when `use_pidns`
     /// is true without `use_netns`).
     pub use_pidns: bool,
+    /// Run under a user namespace with the current uid/gid mapped
+    /// 1:1 (`unshare --user --map-current-user`). Linux only.
+    ///
+    /// An isolation-hardening layer, not an enforcement mechanism:
+    /// the target is capless (mapping a non-root uid clears the
+    /// namespace capabilities across exec), the host network is
+    /// fully shared, and Yama ptrace coverage is unchanged (plain
+    /// runs stay enforceable only at scopes 0/1). Never interacts
+    /// with `use_netns`: the two are mutually exclusive, and this
+    /// flag must not leak into network-namespace, bridge, or DNS
+    /// eligibility anywhere.
+    pub use_userns: bool,
     /// Enable DNS query capture inside the network namespace.
     ///
     /// When enabled, the bridge child runs a DNS server on UDP port 53
@@ -280,6 +292,32 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Validate the `use_userns` combination rules.
+    ///
+    /// Fail-closed on ambiguous requests rather than choosing a
+    /// mapping: the netns-implying modes already create a user
+    /// namespace with a root mapping, and PID namespaces require
+    /// the netns launch shape. Called by the CLI and the launcher;
+    /// the launcher additionally rejects a user namespace requested
+    /// alongside a network proxy (a `Config`-level field).
+    pub fn validate_userns(&self) -> crate::Result<()> {
+        if !self.use_userns {
+            return Ok(());
+        }
+        if !cfg!(target_os = "linux") {
+            return Err(crate::Error::Validation("--userns requires Linux".into()));
+        }
+        if self.use_netns || self.use_pidns {
+            return Err(crate::Error::Validation(
+                "--userns is exclusive with the network-namespace modes \
+                 (--deny-network, --allow-host, --allow-network-listeners, \
+                 --proxy-socket) and with --pid namespaces"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate availability of an explicitly requested Unix socket policy.
     pub fn validate_unix_socket_policy(&self) -> crate::Result<()> {
         if self.deny_unix_sockets
@@ -501,4 +539,30 @@ pub struct ResourceUsage {
     pub io_read_bytes: i64,
     /// Total I/O bytes written (summed across all devices).
     pub io_write_bytes: i64,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod userns_tests {
+    use super::*;
+
+    #[test]
+    fn userns_valid_without_conflicts() {
+        let mut profile = Profile::default();
+        assert!(profile.validate_userns().is_ok());
+        profile.use_userns = true;
+        assert!(profile.validate_userns().is_ok());
+    }
+
+    #[test]
+    fn userns_rejects_netns_and_pidns_combinations() {
+        let mut profile = Profile::default();
+        profile.use_userns = true;
+        profile.use_netns = true;
+        assert!(profile.validate_userns().is_err());
+        profile.use_netns = false;
+        profile.use_pidns = true;
+        assert!(profile.validate_userns().is_err());
+        profile.use_pidns = false;
+        assert!(profile.validate_userns().is_ok());
+    }
 }
