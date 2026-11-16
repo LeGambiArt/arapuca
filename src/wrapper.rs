@@ -281,3 +281,191 @@ mod tests {
         }
     }
 }
+
+/// Scrub root-derived capabilities for the process about to be
+/// exec'd as the sandboxed target.
+///
+/// `SECBIT_NOROOT` suppresses the full-capability grant the kernel
+/// applies at exec for uid 0 in a user namespace; `SECBIT_NOROOT_-
+/// LOCKED` makes it irrevocable. Without this, a target running as
+/// root inside `unshare --user --map-root-user` retains
+/// `CAP_SYS_PTRACE` in the shared namespace, which bypasses both
+/// `PR_SET_DUMPABLE=0` and Yama on every same-namespace process —
+/// including the unotify supervisor whose seccomp allowlist permits
+/// `connect()`, i.e. a memory-corrupted supervisor is a policy
+/// bypass. The scrub makes the target capless at the exec boundary.
+///
+/// The prctl can fail with `EPERM` for a process that holds no
+/// capabilities and is not uid 0 in its user namespace — exactly the
+/// processes for which the suppressed grant does not exist. That
+/// case is a no-op; every other failure is fatal (fail-closed).
+#[cfg(target_os = "linux")]
+pub fn scrub_capabilities_for_exec() -> Result<(), String> {
+    const PR_SET_SECUREBITS: libc::c_int = 28;
+    const PR_GET_SECUREBITS: libc::c_int = 29;
+    const SECBIT_NOROOT: libc::c_ulong = 1 << 0;
+    const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
+    // PR_CAP_AMBIENT_CLEAR_ALL needs no privilege and must run FIRST:
+    // SECBIT_NOROOT does not touch the ambient set, so an ambient
+    // CAP_SETPCAP would let the prctl below succeed while every other
+    // ambient capability (CAP_SYS_PTRACE included) survives into the
+    // target — the opposite of "capless at exec".
+    const PR_CAP_AMBIENT: libc::c_int = 47;
+    const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
+    // SAFETY: prctl with scalar arguments; no pointers involved.
+    let ret = unsafe { libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        // EINVAL is the kernel's answer when ambient capabilities are
+        // unsupported (pre-4.3): nothing to clear there.
+        if err.raw_os_error() != Some(libc::EINVAL) {
+            return Err(format!("PR_CAP_AMBIENT_CLEAR_ALL: {err}"));
+        }
+    }
+
+    // OR the bits in instead of replacing the whole set: overwriting
+    // would silently clear unlocked bits the parent set (e.g.
+    // SECBIT_NO_CAP_AMBIENT_RAISE under systemd) and EPERM when the
+    // parent locked any other bit.
+    // SAFETY: prctl with scalar arguments; no pointers involved.
+    let current = unsafe { libc::prctl(PR_GET_SECUREBITS, 0, 0, 0, 0) };
+    let wanted = SECBIT_NOROOT | SECBIT_NOROOT_LOCKED;
+    if current >= 0 && (current as libc::c_ulong & wanted) == wanted {
+        return Ok(());
+    }
+    // SAFETY: prctl with scalar arguments; no pointers involved.
+    let ret = unsafe {
+        libc::prctl(
+            PR_SET_SECUREBITS,
+            (current.max(0) as libc::c_ulong | wanted) as libc::c_ulong,
+            0,
+            0,
+            0,
+        )
+    };
+    if ret == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EPERM) && root_grant_absent() {
+        return Ok(());
+    }
+    Err(format!("PR_SET_SECUREBITS: {err}"))
+}
+
+/// True when the exec-time root capability grant cannot apply to
+/// this process: not uid 0 in the current user namespace and no
+/// permitted capabilities. Uses `capget` rather than
+/// `/proc/self/status` because the scrub runs after Landlock, which
+/// does not grant /proc.
+#[cfg(target_os = "linux")]
+fn root_grant_absent() -> bool {
+    // The exec-time root grant only exists for a root uid, and only
+    // if the bounding set still carries anything that could be
+    // re-gained. The permitted set is the wrong signal: it is empty
+    // for a root container with cap-drop ALL (which still has the
+    // grant masked, but nothing to gain) and non-empty for a non-root
+    // service with AmbientCapabilities (which can never gain the
+    // root grant at all). Both of those must count as "grant absent"
+    // or every launch in them fails.
+    // SAFETY: geteuid/getuid take no arguments.
+    if unsafe { libc::geteuid() } == 0 || unsafe { libc::getuid() } == 0 {
+        // Root uid with an empty permitted set under
+        // no-new-privs: nothing can be gained at exec — the kernel
+        // intersects file-derived capabilities with the OLD
+        // permitted set (cap_bprm_creds_from_file), and NNP is set
+        // before this runs. Observed in the wild: root containers
+        // and the viveiro agent harness run exactly this shape
+        // (uid 0, CapPrm=0, CapBnd full) and every launch failed.
+        // SAFETY: prctl with scalar arguments.
+        let nnp = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } == 1;
+        #[cfg(target_os = "linux")]
+        if nnp && permitted_set_empty() {
+            return true;
+        }
+        // Otherwise the grant exists unless the bounding set is
+        // empty — then no capability can ever be regained.
+        // CAP_LAST_CAP is not in libc. 40 (CAP_CHECKPOINT_RESTORE)
+        // is the last capability on current kernels; read one past
+        // it so the loop covers everything — PR_CAPBSET_READ answers
+        // EINVAL above the last capability, treated as "not
+        // present".
+        for cap in 0..=41 {
+            // SAFETY: prctl PR_CAPBSET_READ with a plain capability
+            // number.
+            let r = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) };
+            if r > 0 {
+                return false;
+            }
+        }
+        return true;
+    }
+    // Non-root uid: no root grant can ever apply — a setuid-root
+    // exec would need a root uid. Under no-new-privs the exec-time
+    // gain is intersected with the old permitted set, so a
+    // capability held in the permitted set can survive a
+    // file-capabilities exec; that is a narrower residual than the
+    // old permitted==0 test, which refused every launch for
+    // non-root services with AmbientCapabilities.
+    // Testing the ambient path itself needs a capability in the
+    // permitted set, which the unprivileged test runner does not
+    // have; the uid logic is what the unprivileged tests pin.
+    true
+}
+
+/// Whether this process's permitted capability set is empty.
+#[cfg(target_os = "linux")]
+fn permitted_set_empty() -> bool {
+    // SAFETY: capget with stack structs of the ABI shapes from
+    // include/uapi/linux/capability.h; pid 0 means "this process".
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let mut hdr = CapHeader {
+        version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+        pid: 0,
+    };
+    let mut data = [CapData::default(); 2];
+    // SAFETY: syscall with valid pointers to live stack structs.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut hdr as *mut CapHeader,
+            data.as_mut_ptr(),
+        )
+    };
+    ret == 0 && data.iter().all(|d| d.permitted == 0)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod securebits_tests {
+    use super::*;
+
+    #[test]
+    fn scrub_succeeds_or_noops_for_unprivileged_caller() {
+        // As the unprivileged test user the prctl either succeeds
+        // (setting the bits is permitted) or returns EPERM with the
+        // root grant absent — both acceptable; anything else fails.
+        scrub_capabilities_for_exec().expect("scrub must succeed or no-op");
+    }
+
+    #[test]
+    fn root_grant_absent_for_unprivileged_test_user() {
+        // The test runner is unprivileged: euid != 0 and CapPrm is
+        // empty, so the grant is absent. (Skipped implicitly when run
+        // as root, where euid == 0 makes the predicate false.)
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        assert!(root_grant_absent());
+    }
+}

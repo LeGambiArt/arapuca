@@ -621,6 +621,15 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
             .chain(std::iter::once(std::ptr::null()))
             .collect();
 
+        // Scrub root-derived capabilities (SECBIT_NOROOT): the
+        // target must be capless in the user namespace (see
+        // wrapper::scrub_capabilities_for_exec).
+        #[cfg(target_os = "linux")]
+        if let Err(e) = crate::wrapper::scrub_capabilities_for_exec() {
+            write_stderr(&format!("arapuca: selfexec: {e}\n"));
+            libc::_exit(1);
+        }
+
         libc::execve(c_cmd.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
         write_stderr(&format!(
             "arapuca: selfexec: exec {}: {}\n",
