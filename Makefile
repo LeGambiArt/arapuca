@@ -42,11 +42,14 @@ test-unit:
 	cargo test --lib
 
 # Integration tests (platform-specific).
-# Linux: exercises Landlock, seccomp, cgroups.
+# Linux: exercises Landlock, seccomp, cgroups, the unotify
+# supervisor/UDS-policy topology, and the userns mode — with skip
+# accounting (a suite whose every test skipped fails rather than
+# reporting a vacuous green).
 # macOS: exercises Seatbelt sandbox-exec.
 test-integration:
 ifeq ($(shell uname -s),Linux)
-	cargo test --test adversarial
+	./scripts/run-integration-tests.sh
 endif
 ifeq ($(shell uname -s),Darwin)
 	cargo test --test darwin

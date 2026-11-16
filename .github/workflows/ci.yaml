@@ -55,9 +55,9 @@ jobs:
     needs: check-linux
     steps:
       - name: Install deps
-        run: dnf install -y gcc make cargo openssl-devel python3
+        run: dnf install -y gcc make cargo openssl-devel python3 iproute
 
       - uses: actions/checkout@v7.0.1
 
       - name: Integration tests
-        run: make test-integration
+        run: chmod +x scripts/run-integration-tests.sh && make test-integration

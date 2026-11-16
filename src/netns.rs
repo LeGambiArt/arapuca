@@ -28,6 +28,27 @@ pub fn available() -> bool {
     }
 }
 
+/// Probe whether a user namespace with the current uid/gid mapped
+/// 1:1 works on this system.
+///
+/// Runs `unshare --user --map-current-user -- /bin/true` — the exact
+/// flags the `--userns` launch uses. Fails on hosts that disable
+/// unprivileged user namespaces (kernel or LSM policy) and on
+/// util-linux versions without `--map-current-user`, so the launcher
+/// can fall back loudly instead of failing mid-run.
+pub fn userns_current_user_available() -> bool {
+    let result = Command::new("unshare")
+        .args(["--user", "--map-current-user", "--", "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match result {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
 /// Probe whether mount namespace isolation works alongside netns.
 ///
 /// Tests `unshare --user --net --mount --map-root-user -- /bin/true`.

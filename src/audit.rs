@@ -318,6 +318,11 @@ pub enum SandboxLayer {
     ProcessSpawn,
     DnsCapture,
     PidNamespace,
+    /// Standalone user namespace (`--userns`, current uid/gid mapped
+    /// 1:1). Only reported for that mode — the user namespace that
+    /// network-namespace modes create implicitly is part of their
+    /// `NetworkNamespace` event.
+    UserNamespace,
     UnotifySupervisor,
     ConnectProxy,
 }
