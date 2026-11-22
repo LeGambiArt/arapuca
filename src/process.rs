@@ -1221,8 +1221,14 @@ mod tests {
             tmp_dir: dir,
             cgroup_path: None,
             cgroup_mgr: None,
-            dns_audit_pipe: Some(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(pipe_read) }),
+            dns_audit_pipe: Some(unsafe {
+                use std::os::fd::FromRawFd;
+                std::os::fd::OwnedFd::from_raw_fd(pipe_read)
+            }),
             unotify_audit_pipe: None,
+            connect_proxy_pid: None,
+            connect_proxy_pidfd: None,
+            connect_proxy_socket: None,
             pidfd: None,
             target_pid: None,
             pidns_active: false,
