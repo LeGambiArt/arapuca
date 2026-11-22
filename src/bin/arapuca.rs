@@ -34,6 +34,30 @@ fn main() {
         return;
     }
 
+    // ── Supervisor mode ───────────────────────────────────────
+    // Internal entry point for the unotify supervisor's parent
+    // topology. Exists solely as the launcher-spawned supervisor:
+    // performs no Landlock/rlimit/cgroup setup of its own and is
+    // never a user-facing subcommand. Sentinel-gated like the
+    // wrapper path; the PDEATHSIG check inside fail-closes against
+    // forged in-sandbox invocation.
+    if args.get(1).is_some_and(|a| a == "--supervisor") {
+        if std::env::var("ARAPUCA_SUPERVISOR").as_deref() != Ok("1") {
+            eprintln!(
+                "arapuca: supervisor path requires library invocation \
+                 (ARAPUCA_SUPERVISOR not set)"
+            );
+            std::process::exit(1);
+        }
+        #[cfg(seccomp_supported)]
+        arapuca::unotify::run_supervisor_mode(&args);
+        #[cfg(not(seccomp_supported))]
+        {
+            eprintln!("arapuca: supervisor mode requires seccomp support");
+            std::process::exit(1);
+        }
+    }
+
     // Dispatch subcommands before the sandbox path.
     if args.get(1).is_some_and(|a| a == "image") {
         image_subcommand(&args[2..]);
@@ -182,13 +206,19 @@ fn main() {
         }
     }
 
-    // 0b. Unconditional setsid — detach from parent's session.
-    // Called BEFORE pdeathsig since setsid clears it.
-    // Tolerate EPERM (already a session leader from library's pre_exec).
+    // 0b. setsid — detach from parent's session. Called BEFORE
+    // pdeathsig since setsid clears it. Tolerate EPERM (already a
+    // session leader from library's pre_exec).
+    // Supervisor-mode launches SKIP it: the supervisor already made
+    // us a process-group leader (setpgid on both sides of its
+    // fork), so setsid would either fail EPERM or — if we won the
+    // race — escape the supervisor's session, breaking tty signal
+    // routing (Ctrl-C would kill the supervisor → PDEATHSIG SIGKILL
+    // instead of SIGINT to the target) and the orphan sweep.
     #[cfg(target_os = "linux")]
     let parent_pid = unsafe { libc::getppid() };
     #[cfg(unix)]
-    {
+    if std::env::var("ARAPUCA_UNOTIFY_SP_FD").is_err() {
         // SAFETY: setsid is async-signal-safe, no arguments.
         let ret = unsafe { libc::setsid() };
         if ret == -1 {
@@ -469,9 +499,12 @@ fn main() {
                 Ok("baseline") => arapuca::SeccompProfile::Baseline,
                 _ => arapuca::SeccompProfile::Strict,
             };
-            let block_dumpable_zero = unotify_config
-                .as_ref()
-                .is_some_and(|c| c.enforce_unix_connect);
+            // Block PR_SET_DUMPABLE(0) whenever ANY unotify feature is
+            // active, not only the connect policy: a non-dumpable
+            // target is invisible to the audit supervisor (silent
+            // skip, no record), and the policy case additionally
+            // turns it into an EACCES.
+            let block_dumpable_zero = unotify_config.is_some();
             if let Err(e) =
                 arapuca::seccomp::apply(&seccomp_profile, deny_unix_sockets, block_dumpable_zero)
             {

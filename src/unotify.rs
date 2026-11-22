@@ -587,8 +587,20 @@ pub fn handle_notification(
             args[2],
         ),
         _ => match mem {
-            // Audit-only syscalls tolerate inspection failure.
-            None => respond_continue(listener_fd, notif),
+            // Audit-only syscalls tolerate inspection failure — but
+            // silently continuing hides that the event was never
+            // seen. An uninspectable process (re-parented descendant
+            // on a plain Yama-1 run, or a non-dumpable exec) leaves
+            // no record and no drop count, which reads as "nothing
+            // happened". Write the failure itself as the audit line.
+            None => {
+                write_audit_line(
+                    audit_fd,
+                    dropped,
+                    &format!("{{\"type\":\"inspection_failed\",\"pid\":{pid},\"nr\":{nr}}}\n"),
+                );
+                respond_continue(listener_fd, notif)
+            }
             Some(mem) => handle_audit_syscall(listener_fd, notif, &mem, audit_fd, config, dropped),
         },
     }
@@ -1974,34 +1986,163 @@ fn write_audit_line(
 
 // ─── Supervisor loop ──────────────────────────────────────────────
 
+/// How the supervisor loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopExit {
+    /// The listener was destroyed (target exited) or closed — the
+    /// normal end of a run.
+    ListenerClosed,
+    /// Any other receive error — the listener may still be alive
+    /// while nothing is serving it.
+    Error,
+}
+
 /// Main notification processing loop. Runs in the supervisor child.
 ///
 /// Loops on `notif_recv()`, dispatches each notification to
-/// `handle_notification()`, and exits when the listener FD becomes
-/// invalid (target process exited, filter destroyed → ENOENT).
-pub fn supervisor_loop(listener_fd: RawFd, audit_fd: RawFd, config: &UnotifyConfig) -> ! {
+/// `handle_notification()`, and returns when the listener FD becomes
+/// invalid. The caller decides what happens next: the legacy
+/// child-topology supervisor `_exit`s; the supervisor-mode parent
+/// applies the kill-or-wait rule and reaps the wrapper.
+pub fn supervisor_loop(
+    listener_fd: RawFd,
+    audit_fd: RawFd,
+    config: &UnotifyConfig,
+    child_pid: Option<i32>,
+) -> LoopExit {
     use std::sync::atomic::Ordering;
     let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> =
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    // Watch the wrapper (parent topology): a USER_NOTIF filter is
+    // refcounted per task, so notif_recv returns ENOENT only when
+    // the LAST task carrying it exits. If the target forks a child
+    // and exits, a purely listener-driven loop blocks until that
+    // descendant dies — wedging the run and defeating --timeout.
+    // Polling a pidfd on the wrapper ends the loop at wrapper
+    // death; surviving descendants lose broker services (their
+    // intercepted syscalls fail closed) and are swept by the
+    // launcher's process-group kill. The legacy topology passes
+    // None — its supervisor dies with the wrapper via PDEATHSIG.
+    let pidfd: i32 = child_pid
+        .map(|pid| unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32)
+        .unwrap_or(-1);
+
+    let mut exit = LoopExit::ListenerClosed;
     loop {
-        match notif_recv(listener_fd) {
-            Ok(notif) => {
-                handle_notification(listener_fd, &notif, audit_fd, config, &dropped);
-            }
-            Err(e) => {
-                let errno = e.raw_os_error().unwrap_or(0);
-                if errno == libc::EINTR {
-                    continue;
-                }
-                // ENOENT: filter destroyed (target exited). Normal exit.
-                // EBADF: listener FD closed. Also normal.
-                if errno != libc::ENOENT && errno != libc::EBADF {
-                    log::warn!("unotify supervisor: recv error: {e}");
-                }
+        // Subreaper duty: reap adopted descendants (zombies of
+        // processes that re-parented to this supervisor), or they
+        // accumulate for the wrapper's whole lifetime. The wrapper
+        // itself is NOT reaped here — its status belongs to the
+        // post-loop waitpid — so peek with WNOWAIT and stop at it.
+        loop {
+            let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: waitid P_ALL, non-blocking, no-reap peek.
+            let ret = unsafe {
+                libc::waitid(
+                    libc::P_ALL,
+                    0,
+                    &mut si,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            let pid = unsafe { si.si_pid() };
+            if ret != 0 || pid == 0 {
                 break;
             }
+            if child_pid == Some(pid) {
+                break;
+            }
+            let mut st: libc::c_int = 0;
+            // SAFETY: waitpid on the specific adopted child.
+            unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
         }
+
+        let mut fds = [
+            libc::pollfd {
+                fd: listener_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let n_fds = if pidfd >= 0 { 2 } else { 1 };
+        // A 250 ms timeout, not an infinite wait: adopted descendants
+        // (subreaper duty) become zombies that ppoll never wakes for —
+        // SIGCHLD is ignored by default — and under the connect policy
+        // alone, notifications can be rare enough that zombies pile up
+        // against pids.max and RLIMIT_NPROC for the wrapper's whole
+        // lifetime. The periodic wake runs the loop-top reaper.
+        let mut poll_timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 250_000_000,
+        };
+        // SAFETY: ppoll with a valid pollfd array, a stack timespec,
+        // and no signal-mask manipulation.
+        let ready = unsafe {
+            libc::ppoll(
+                fds.as_mut_ptr(),
+                n_fds,
+                &mut poll_timeout as *mut libc::timespec,
+                std::ptr::null(),
+            )
+        };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            log::warn!("unotify supervisor: ppoll: {err}");
+            exit = LoopExit::Error;
+            break;
+        }
+        if pidfd >= 0 && fds[1].revents != 0 {
+            // The wrapper died. Confirm WITHOUT reaping (WNOWAIT) —
+            // the post-loop waitpid still owns the exit status.
+            let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: waitid with WEXITED|WNOHANG|WNOWAIT on our
+            // direct child.
+            let ret = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child_pid.unwrap() as libc::id_t,
+                    &mut si,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if ret == 0 && unsafe { si.si_pid() } != 0 {
+                break;
+            }
+            // Not a confirmed exit — keep serving the listener.
+        }
+        if fds[0].revents != 0 {
+            match notif_recv(listener_fd) {
+                Ok(notif) => {
+                    handle_notification(listener_fd, &notif, audit_fd, config, &dropped);
+                }
+                Err(e) => {
+                    let errno = e.raw_os_error().unwrap_or(0);
+                    if errno == libc::EINTR {
+                        continue;
+                    }
+                    // ENOENT: filter destroyed (target exited). Normal exit.
+                    // EBADF: listener FD closed. Also normal.
+                    if errno != libc::ENOENT && errno != libc::EBADF {
+                        log::warn!("unotify supervisor: recv error: {e}");
+                        exit = LoopExit::Error;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    if pidfd >= 0 {
+        // SAFETY: pidfd is a valid descriptor or already closed.
+        unsafe { libc::close(pidfd) };
     }
 
     // Flush final drop count.
@@ -2011,7 +2152,7 @@ pub fn supervisor_loop(listener_fd: RawFd, audit_fd: RawFd, config: &UnotifyConf
         let _ = unsafe { libc::write(audit_fd, summary.as_ptr().cast(), summary.len()) };
     }
 
-    unsafe { libc::_exit(0) }
+    exit
 }
 
 // ─── Availability probe ───────────────────────────────────────────
@@ -2462,8 +2603,11 @@ pub fn fork_unotify_supervisor(
             libc::close(sp_child);
         }
 
-        // Enter the supervisor loop (never returns).
-        supervisor_loop(listener_fd, audit_write_fd, &child_config);
+        // Enter the supervisor loop and exit with its historical
+        // status (the legacy child's lifecycle is pdeathsig-managed;
+        // there is nothing to reap).
+        let _ = supervisor_loop(listener_fd, audit_write_fd, &child_config, None);
+        unsafe { libc::_exit(0) };
     }
 
     // ── Parent (wrapper) ─────────────────────────────────────
@@ -2478,6 +2622,431 @@ pub fn fork_unotify_supervisor(
         socketpair_parent: sp_parent,
         readiness_read,
     })
+}
+
+// ─── Supervisor mode ───────────────────────────────────────────────
+//
+// The parent-topology entry point: the launcher spawns the arapuca
+// binary in supervisor mode (inside the same `unshare` the wrapper
+// would get), and this process forks + execs the wrapper as its own
+// child. Yama ptrace_scope >= 1 permits ptrace only of descendants,
+// so the supervisor inspecting its child needs no capabilities —
+// unlike the legacy child topology, where the supervisor was the
+// target's child and needed a user namespace to inspect its parent.
+//
+// argv: [arapuca, --supervisor, --, <cmd>...]
+// env (all set by the launcher):
+//   ARAPUCA_SUPERVISOR=1        sentinel (also checked by main)
+//   ARAPUCA_WRAPPER_EXEC_FD=N   pinned wrapper binary fd (exec'd
+//                               via /proc/self/fd/N — never a PATH
+//                               lookup)
+//   ARAPUCA_CGROUP_SYNC_FD=N    cgroup sync read end (consumed here,
+//                               BEFORE the wrapper fork — the fork is
+//                               the cgroup-membership inheritance
+//                               point)
+//   ARAPUCA_SUPERVISOR_TTY=1    tty run: make the wrapper's process
+//                               group the terminal foreground group
+//   ARAPUCA_UNOTIFY_CONFIG      the supervisor config (strict parse)
+//   ARAPUCA_UNOTIFY_AUDIT_FD    the supervisor's audit pipe
+//   ARAPUCA_SECCOMP_DEBUG       allowlist debug mode
+// plus every ARAPUCA_* var the wrapper itself needs (passed through
+// the exec unchanged, minus the two consumed here).
+
+/// Run the supervisor-mode lifecycle. Never returns.
+pub fn run_supervisor_mode(args: &[String]) -> ! {
+    use crate::wrapper::write_stderr;
+
+    // The command starts after the "--" that follows the marker.
+    let cmd_start = args.iter().position(|a| a == "--").and_then(|i| {
+        if i + 1 < args.len() {
+            Some(i + 1)
+        } else {
+            None
+        }
+    });
+    let Some(cmd_start) = cmd_start else {
+        write_stderr("arapuca: supervisor: missing command after --\n");
+        unsafe { libc::_exit(125) };
+    };
+
+    // 1. Die with the launcher. This is also the load-bearing
+    //    defense against forged in-sandbox invocation: a sandboxed
+    //    process exec'ing arapuca with a forged sentinel dies here
+    //    (its inherited seccomp EPERMs the prctl).
+    //
+    // The parent is sampled BEFORE the prctl: if the launcher dies in
+    // that window the signal never arrives, and comparing getppid()
+    // with a value sampled afterwards would compare the call with
+    // itself.
+    let parent_pid = unsafe { libc::getppid() };
+    // SAFETY: prctl with scalar arguments.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        write_stderr("arapuca: supervisor: PR_SET_PDEATHSIG failed\n");
+        unsafe { libc::_exit(1) };
+    }
+    if unsafe { libc::getppid() } != parent_pid {
+        unsafe { libc::_exit(1) };
+    }
+    // 2. Not ptraceable by same-uid processes (exec resets this; the
+    //    launcher's pre_exec value did not survive our own exec).
+    // SAFETY: prctl with scalar arguments.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+        write_stderr("arapuca: supervisor: PR_SET_DUMPABLE failed\n");
+        unsafe { libc::_exit(1) };
+    }
+
+    // 3. Consume the cgroup sync byte BEFORE forking the wrapper:
+    //    the launcher added THIS process to the cgroup and signaled
+    //    readiness; the fork inherits membership from this point on,
+    //    which closes the fork-before-add_pid race.
+    if let Ok(fd_str) = std::env::var("ARAPUCA_CGROUP_SYNC_FD") {
+        match fd_str.parse::<i32>() {
+            Ok(fd) => {
+                let mut buf = [0u8; 1];
+                // SAFETY: read of one byte from the launcher's pipe.
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), 1) };
+                // SAFETY: fd is a valid pipe end.
+                unsafe { libc::close(fd) };
+                if n != 1 {
+                    write_stderr("arapuca: supervisor: cgroup sync failed\n");
+                    unsafe { libc::_exit(1) };
+                }
+            }
+            // The launcher writes this value, so a malformed one means
+            // a launcher/supervisor mismatch. Skipping the handshake
+            // silently would let the wrapper fork before the cgroup
+            // membership is established, which is what the byte
+            // exists to prevent.
+            Err(_) => {
+                write_stderr("arapuca: supervisor: invalid ARAPUCA_CGROUP_SYNC_FD\n");
+                unsafe { libc::_exit(1) };
+            }
+        }
+    }
+
+    // 4. Socketpair for the listener handover. The child end must
+    //    survive the exec into the wrapper (no CLOEXEC); the parent
+    //    end is closed after the handover.
+    let mut sv = [0i32; 2];
+    // SAFETY: socketpair with a valid array.
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
+        write_stderr(&format!(
+            "arapuca: supervisor: socketpair: {}\n",
+            std::io::Error::last_os_error()
+        ));
+        unsafe { libc::_exit(1) };
+    }
+    let sp_parent = sv[0];
+    let sp_child = sv[1];
+
+    // Become a child subreaper BEFORE forking the wrapper: on plain
+    // Yama-1 runs the supervisor has no CAP_SYS_PTRACE and can only
+    // inspect its own descendants. When an intermediate process
+    // exits, its orphans re-parent to init or the user's systemd --
+    // outside the supervisor's subtree -- and every later inspection
+    // of them fails with EPERM. As a subreaper the supervisor adopts
+    // them instead, keeping them inspectable (and swept) for the
+    // wrapper's whole lifetime.
+    // SAFETY: prctl with scalar arguments.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1i64) } != 0 {
+        write_stderr("arapuca: supervisor: PR_SET_CHILD_SUBREAPER failed\n");
+        unsafe { libc::_exit(1) };
+    }
+
+    // Forward terminal signals to the wrapper instead of dying to
+    // them: the supervisor is the session's long-lived member now,
+    // and systemd's KillMode=control-group TERMs every task in the
+    // unit's cgroup subtree. Dying here PDEATHSIG-SIGKILLs the
+    // wrapper before its own handler can finish a clean shutdown.
+    // SA_RESTART keeps the loop's ppoll/waitpid from fragmenting.
+    // SAFETY: sigaction with a valid handler and flags.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = supervisor_forward_signal as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+
+    // The pinned wrapper fd: exec /proc/self/fd/N, clearing CLOEXEC
+    // first (the launcher set it to survive only one hop).
+    let wrapper_fd: i32 = match std::env::var("ARAPUCA_WRAPPER_EXEC_FD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(fd) => fd,
+        None => {
+            write_stderr("arapuca: supervisor: ARAPUCA_WRAPPER_EXEC_FD not set\n");
+            unsafe { libc::_exit(125) };
+        }
+    };
+    let wrapper_path = format!("/proc/self/fd/{wrapper_fd}");
+
+    // SAFETY: getpid is always safe. Sampled BEFORE the fork so the
+    // child's pdeathsig race check compares against the real parent.
+    let supervisor_pid = unsafe { libc::getpid() };
+    // SAFETY: single-threaded at this point (fresh exec, no threads).
+    let child_pid = unsafe { libc::fork() };
+    WRAPPER_PID.store(child_pid, std::sync::atomic::Ordering::Release);
+    if child_pid < 0 {
+        write_stderr(&format!(
+            "arapuca: supervisor: fork: {}\n",
+            std::io::Error::last_os_error()
+        ));
+        unsafe { libc::_exit(1) };
+    }
+
+    if child_pid == 0 {
+        // ── Wrapper child ──────────────────────────────────────
+        // SAFETY: close the parent's socketpair end.
+        unsafe { libc::close(sp_parent) };
+        // Clear CLOEXEC on the pinned wrapper fd so execve of
+        // /proc/self/fd/N resolves.
+        // SAFETY: fcntl on a valid fd.
+        let flags = unsafe { libc::fcntl(wrapper_fd, libc::F_GETFD) };
+        if flags >= 0 {
+            // SAFETY: fcntl on a valid fd.
+            unsafe { libc::fcntl(wrapper_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+        }
+
+        // fork() clears the parent-death signal, and the wrapper only
+        // re-arms it after exec, Rust startup, PATH lookup and
+        // canonicalize — a window in which a dead supervisor leaves
+        // an orphan that sails through its own ppid check. Re-arm
+        // here, before the exec.
+        // SAFETY: prctl with scalar arguments.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+        // SAFETY: getppid is always safe.
+        if unsafe { libc::getppid() } != supervisor_pid {
+            unsafe { libc::_exit(1) };
+        }
+        // Env surgery: strip the supervisor-only vars, add the
+        // socketpair end. The wrapper sees a clean launcher-shaped
+        // environment.
+        let sp_env = format!("ARAPUCA_UNOTIFY_SP_FD={sp_child}");
+        let envp: Vec<std::ffi::CString> = std::env::vars_os()
+            .filter(|(k, _)| k != "ARAPUCA_SUPERVISOR" && k != "ARAPUCA_CGROUP_SYNC_FD")
+            .map(|(k, v)| {
+                let kv = format!("{}={}", k.to_string_lossy(), v.to_string_lossy());
+                std::ffi::CString::new(kv).unwrap_or_default()
+            })
+            .chain(std::iter::once(
+                std::ffi::CString::new(sp_env).unwrap_or_default(),
+            ))
+            .collect();
+
+        // argv: [arapuca, --, <cmd>...]
+        let argv: Vec<std::ffi::CString> =
+            std::iter::once(std::ffi::CString::new("arapuca").unwrap_or_default())
+                .chain(std::iter::once(
+                    std::ffi::CString::new("--").unwrap_or_default(),
+                ))
+                .chain(
+                    args[cmd_start..]
+                        .iter()
+                        .map(|a| std::ffi::CString::new(a.as_str()).unwrap_or_default()),
+                )
+                .collect();
+
+        let argv_ptrs: Vec<*const libc::c_char> = argv
+            .iter()
+            .map(|a| a.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        let envp_ptrs: Vec<*const libc::c_char> = envp
+            .iter()
+            .map(|e| e.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        let c_path = std::ffi::CString::new(wrapper_path).unwrap_or_default();
+
+        // SAFETY: execve with valid argv/envp arrays; does not
+        // return on success.
+        unsafe {
+            libc::execve(c_path.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+        }
+        write_stderr(&format!(
+            "arapuca: supervisor: exec wrapper: {}\n",
+            std::io::Error::last_os_error()
+        ));
+        unsafe { libc::_exit(1) };
+    }
+
+    // ── Supervisor parent ────────────────────────────────────────
+    // SAFETY: close the fork-child-side socketpair end.
+    unsafe { libc::close(sp_child) };
+
+    // The wrapper becomes its own process-group leader; on tty runs
+    // it also becomes the terminal's foreground group (the target
+    // receives terminal signals, the supervisor does not, and the
+    // target's own setsid() fails EPERM as a group leader — the
+    // same observable behavior as the legacy topology).
+    // SAFETY: setpgid on a direct child.
+    if unsafe { libc::setpgid(child_pid, child_pid) } != 0 {
+        write_stderr("arapuca: supervisor: setpgid failed\n");
+        // Non-fatal: the sweep and tty degrade, the policy does not.
+    }
+    if std::env::var("ARAPUCA_SUPERVISOR_TTY").as_deref() == Ok("1") {
+        // tcsetpgrp from a process that is itself in a background
+        // process group raises SIGTTOU, and its default action STOPS
+        // the caller: the supervisor would hang here instead of
+        // reporting the failure and carrying on. Interactive shells
+        // ignore SIGTTOU around the same call for the same reason.
+        // SAFETY: signal disposition change with the default handler.
+        unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+        // SAFETY: tcsetpgrp on stdin (the controlling terminal) —
+        // best effort.
+        unsafe {
+            if libc::tcsetpgrp(0, child_pid) != 0 {
+                write_stderr("arapuca: supervisor: tcsetpgrp failed\n");
+            }
+        }
+    }
+
+    // Apply the supervisor's own seccomp allowlist AFTER the fork
+    // (filters inherit across fork and exec — applying it earlier
+    // would kill the wrapper child). Failure is fail-closed: the
+    // wrapper is still waiting for its ack and sees socketpair EOF.
+    let seccomp_debug = std::env::var("ARAPUCA_SECCOMP_DEBUG").as_deref() == Ok("1");
+    #[cfg(seccomp_supported)]
+    if let Err(e) = apply_supervisor_seccomp(seccomp_debug) {
+        write_stderr(&format!("arapuca: supervisor: seccomp: {e}\n"));
+        unsafe { libc::_exit(1) };
+    }
+
+    // The config (strict parse — a malformed value never degrades
+    // the policy).
+    let config = match crate::env::parse_unotify_config() {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            write_stderr("arapuca: supervisor: no unotify config\n");
+            unsafe { libc::_exit(125) };
+        }
+        Err(e) => {
+            write_stderr(&format!("arapuca: supervisor: {e}\n"));
+            unsafe { libc::_exit(125) };
+        }
+    };
+    let audit_fd: RawFd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(-1);
+
+    // O_NONBLOCK on the audit pipe — the legacy topology's defense,
+    // dropped in the port: a target spamming intercepted syscalls
+    // can fill the 64 KiB pipe, and a blocking write() here would
+    // stall the supervisor (and with it every further intercepted
+    // syscall in the target) forever. With O_NONBLOCK, events are
+    // dropped and counted instead.
+    if audit_fd >= 0 {
+        // SAFETY: fcntl on a valid fd.
+        let flags = unsafe { libc::fcntl(audit_fd, libc::F_GETFL) };
+        if flags >= 0 {
+            // SAFETY: fcntl on a valid fd.
+            unsafe { libc::fcntl(audit_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+    }
+
+    // The handover: read [host_pid, listener_fd], duplicate the
+    // listener (parent → child: permitted by Yama without caps),
+    // ack. The wrapper does not exec before the ack.
+    let mut msg = [0u8; 8];
+    if !read_exact_raw(sp_parent, &mut msg) {
+        write_stderr("arapuca: supervisor: wrapper died before handover\n");
+        reap_and_exit(child_pid, 125);
+    }
+    let wrapper_pid = i32::from_ne_bytes(msg[..4].try_into().unwrap());
+    let remote_fd = i32::from_ne_bytes(msg[4..].try_into().unwrap());
+    // SAFETY: pidfd_open on the wrapper (our descendant).
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, wrapper_pid, 0i32) } as i32;
+    if pidfd < 0 {
+        write_stderr("arapuca: supervisor: pidfd_open failed\n");
+        reap_and_exit(child_pid, 125);
+    }
+    // SAFETY: pidfd_getfd of the listener from our descendant.
+    let listener_fd =
+        unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, remote_fd, 0u32) } as i32;
+    // SAFETY: pidfd is a valid descriptor or -1 (closed either way).
+    unsafe { libc::close(pidfd) };
+    if listener_fd < 0 {
+        write_stderr("arapuca: supervisor: pidfd_getfd failed\n");
+        reap_and_exit(child_pid, 125);
+    }
+    // Ack: one byte back through the socketpair.
+    // SAFETY: write of one byte on the socketpair parent end.
+    unsafe {
+        libc::write(sp_parent, [1u8].as_ptr().cast(), 1);
+        libc::close(sp_parent);
+    }
+
+    // Serve notifications. The wrapper pid is watched so the loop
+    // ends at wrapper death even when descendants carry the filter
+    // (see supervisor_loop).
+    let exit = supervisor_loop(listener_fd, audit_fd, &config, Some(child_pid));
+
+    // Kill-or-wait: an abnormal loop exit while the wrapper may
+    // still live must not stall (the wrapper's intercepted syscalls
+    // would hang without a listener).
+    if exit == LoopExit::Error {
+        // SAFETY: tgkill on our own child.
+        unsafe {
+            libc::syscall(libc::SYS_tgkill, child_pid, child_pid, libc::SIGKILL);
+        }
+    }
+
+    // Reap and exit with the wrapper's status (exit code re-raised,
+    // signal deaths re-raised — full fidelity, no status pipe).
+    let mut wstatus: libc::c_int = 0;
+    loop {
+        // SAFETY: waitpid on our direct child.
+        let ret = unsafe { libc::waitpid(child_pid, &mut wstatus, 0) };
+        if ret == child_pid {
+            if libc::WIFEXITED(wstatus) {
+                unsafe { libc::_exit(libc::WEXITSTATUS(wstatus)) };
+            }
+            if libc::WIFSIGNALED(wstatus) {
+                let sig = libc::WTERMSIG(wstatus);
+                // SAFETY: signal + raise to die with the same signal.
+                unsafe {
+                    libc::signal(sig, libc::SIG_DFL);
+                    libc::raise(sig);
+                }
+                unsafe { libc::_exit(128 + sig) };
+            }
+            unsafe { libc::_exit(125) };
+        }
+        if ret < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        unsafe { libc::_exit(125) };
+    }
+}
+
+/// The wrapper pid for signal forwarding (set after the fork).
+static WRAPPER_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Async-signal-safe handler: forward the signal to the wrapper.
+/// tgkill over kill so the pid cannot be recycled mid-flight.
+extern "C" fn supervisor_forward_signal(sig: libc::c_int) {
+    let pid = WRAPPER_PID.load(std::sync::atomic::Ordering::Acquire);
+    if pid > 0 {
+        // SAFETY: tgkill on our own child.
+        unsafe { libc::syscall(libc::SYS_tgkill, pid, pid, sig) };
+    }
+}
+
+/// Reap the wrapper child and exit with `code` (failure paths where
+/// the handover could not complete).
+fn reap_and_exit(child_pid: i32, code: i32) -> ! {
+    let mut wstatus: libc::c_int = 0;
+    // SAFETY: waitpid on our direct child; the wrapper exits on its
+    // own (ack EOF fail-closed) — bounded wait.
+    let _ = unsafe { libc::waitpid(child_pid, &mut wstatus, 0) };
+    unsafe { libc::_exit(code) };
 }
 
 /// Read the caller's host PID from `/proc/self/stat`.
@@ -2529,6 +3098,10 @@ fn apply_supervisor_seccomp(debug: bool) -> crate::Result<()> {
         libc::SYS_statx,
         libc::SYS_pidfd_open,
         libc::SYS_pidfd_getfd,
+        libc::SYS_wait4,
+        // WNOWAIT exit check in supervisor_loop (does not reap —
+        // the post-loop waitpid still owns the status).
+        libc::SYS_waitid,
     ] {
         allow.insert(nr, vec![]);
     }

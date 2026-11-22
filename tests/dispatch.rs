@@ -249,3 +249,73 @@ fn wrapper_with_sentinel_and_paths_succeeds() {
         "wrapper with sentinel + paths should succeed"
     );
 }
+
+// ─── Supervisor mode sentinel ────────────────────────────────────
+
+#[test]
+fn supervisor_mode_without_sentinel_rejected() {
+    let output = Command::new(arapuca_bin())
+        .args(["--supervisor", "--", "/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "supervisor mode without the sentinel must not run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ARAPUCA_SUPERVISOR"),
+        "error must name the sentinel: {stderr}"
+    );
+}
+
+#[test]
+fn supervisor_mode_with_sentinel_missing_command_rejected() {
+    let output = Command::new(arapuca_bin())
+        .env("ARAPUCA_SUPERVISOR", "1")
+        .arg("--supervisor")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "supervisor mode without a command must fail closed"
+    );
+}
+
+#[test]
+fn supervisor_mode_with_sentinel_missing_wrapper_fd_rejected() {
+    // A forged/incorrect invocation passes the sentinel but lacks
+    // the launcher's fd plumbing: it must fail closed, not fall
+    // through to anything.
+    let output = Command::new(arapuca_bin())
+        .env("ARAPUCA_SUPERVISOR", "1")
+        .args(["--supervisor", "--", "/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "supervisor mode without ARAPUCA_WRAPPER_EXEC_FD must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ARAPUCA_WRAPPER_EXEC_FD") || stderr.contains("supervisor"),
+        "error must name the failure: {stderr}"
+    );
+}
+
+#[test]
+fn supervisor_marker_is_not_a_user_subcommand() {
+    // "supervisor" without the internal marker must be rejected by
+    // the dispatch guard like any unknown subcommand — the mode is
+    // not user-facing.
+    let output = Command::new(arapuca_bin())
+        .arg("supervisor")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown subcommand"),
+        "must read as an unknown subcommand: {stderr}"
+    );
+}

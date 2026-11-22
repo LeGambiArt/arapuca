@@ -1394,3 +1394,112 @@ print("ARAPUCA_PROCS", checked, "DENIED", denied)
         "must have scanned /proc: {stdout}\nstderr: {stderr}"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn uds_policy_serves_reparented_grandchild_connects() {
+    // The supervisor is a child subreaper: a target that double-forks
+    // leaves grandchildren that re-parent to the supervisor, not to
+    // init — keeping them inspectable (and served) on plain Yama-1
+    // runs where the supervisor has no CAP_SYS_PTRACE. Without the
+    // subreaper, the grandchild's connects fail with EACCES while the
+    // wrapper is still alive.
+    if !python3_available() {
+        eprintln!("skipping: requires python3");
+        return;
+    }
+    // Plain run: the policy needs Yama <= 1 (no user namespace to
+    // bypass scope 2 with).
+    if std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .map(|s| s.trim().parse::<u32>().unwrap_or(0) >= 2)
+        .unwrap_or(false)
+    {
+        eprintln!("skipping: yama ptrace_scope>=2 denies plain-run supervision");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("grandchild.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served2 = std::sync::Arc::clone(&served);
+    let _acceptor = std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            match conn {
+                Ok(c) => {
+                    drop(c);
+                    served2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let script = format!(
+        r#"
+import os, socket, sys
+
+# Double-fork: the grandchild is re-parented when the intermediate
+# exits, ending up under the supervisor (subreaper) instead of init.
+pid = os.fork()
+if pid == 0:
+    pid2 = os.fork()
+    if pid2 == 0:
+        # Grandchild: WAIT for the intermediate to exit first, so the
+        # re-parenting has actually happened before the first connect
+        # (otherwise the early connects pass in-tree on any host and
+        # the oracle weakens). Then outlive it a little and connect.
+        import time
+        time.sleep(0.3)
+        os.close(0)
+        path = {path:?}
+        for _ in range(20):
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            rc = s.connect_ex(path)
+            s.close()
+            if rc != 0:
+                print("GRANDCHILD_CONNECT_FAILED", rc, flush=True)
+                sys.exit(7)
+        print("GRANDCHILD_OK", flush=True)
+        sys.exit(0)
+    os._exit(0)
+# Parent (the target): wait for the grandchild indirectly.
+os.waitpid(pid, 0)
+import time
+time.sleep(1.5)
+sys.exit(0)
+"#,
+        path = sock_path.display().to_string()
+    );
+    // PLAIN run (no --deny-network): with the pid namespace, the
+    // grandchild would re-parent to the target itself (pid 1 of its
+    // namespace) and stay in the supervisor's tree regardless — only
+    // a plain run sends it to host init, which is the case the
+    // subreaper exists for.
+    let out = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--seccomp",
+            "baseline",
+            "--deny-privileged-unix-sockets",
+        ])
+        .arg("--")
+        .arg("/usr/bin/python3")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() || stdout.contains("GRANDCHILD_OK"),
+        "grandchild connects must be served after re-parenting: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !stdout.contains("GRANDCHILD_CONNECT_FAILED"),
+        "the re-parented grandchild was denied: {stdout}"
+    );
+    let n = served.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        n >= 20,
+        "the grandchild's connects must reach the listener (got {n})"
+    );
+}
