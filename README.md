@@ -204,7 +204,8 @@ arapuca run \
 | `--deny-network` | Block all network; capture DNS queries as audit events (Linux) |
 | `--userns` | Run under a user namespace (current uid/gid mapped 1:1, capless, host network shared; isolation only — Linux) |
 | `--proxy-socket P` | Run in a network namespace whose loopback is bridged to the Unix socket at `P` (Linux) |
-| `--deny-privileged-unix-sockets` | Deny `connect()` to privileged daemon sockets — docker, podman system, dbus, libvirt, ... (Linux) |
+| `--deny-privileged-unix-sockets` | Deny `connect()` to privileged daemon sockets — docker, podman system, dbus, libvirt, snap LXD, Incus, ... (Linux; best-effort enumeration) |
+| `--deny-user-session-sockets` | With the connect policy: also deny the same-user session daemons (user bus, systemd --user) — `systemd-run --user` otherwise starts a process outside every layer (Linux) |
 | `--unix-socket-deny-root PATH` | Add a deny root for the unix socket policy (Linux) |
 | `--allow-unix-socket-connect` | Disable the unix socket connect policy |
 | `--allow-network-listeners` | Allow TCP bind/inbound; on Linux confines listeners to an isolated network namespace. On macOS, Seatbelt cannot reliably confine listeners to loopback, so use only with trusted programs. |
