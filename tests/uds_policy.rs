@@ -637,6 +637,8 @@ fn run_selfexec(unotify_config: Option<&str>, script: &str) -> (Option<i32>, Str
             );
             libc::setenv(c"ARAPUCA_SECCOMP_PROFILE".as_ptr(), c"baseline".as_ptr(), 1);
             libc::setenv(c"ARAPUCA_ALLOW_EXEC".as_ptr(), c"1".as_ptr(), 1);
+            // Direct selfexec invocation: no caller extra_fds cross.
+            libc::setenv(c"ARAPUCA_TARGET_FDS".as_ptr(), c"0".as_ptr(), 1);
             if let Some(cfg) = unotify_config {
                 let cfg_c = CString::new(cfg).unwrap();
                 libc::setenv(c"ARAPUCA_UNOTIFY_CONFIG".as_ptr(), cfg_c.as_ptr(), 1);
@@ -984,6 +986,8 @@ fn malformed_unotify_config_fails_closed() {
         let out = Command::new(arapuca_bin())
             .args(["--", "/bin/true"])
             .env("ARAPUCA_WRAPPER", "1")
+            // Direct wrapper invocation: declare that no caller extra_fds cross.
+            .env("ARAPUCA_TARGET_FDS", "0")
             .env("ARAPUCA_READ_PATHS", "/usr:/lib:/lib64:/bin")
             .env("ARAPUCA_UNOTIFY_CONFIG", bad)
             .output()

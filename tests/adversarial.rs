@@ -30,6 +30,8 @@ fn sandboxed_command(
         .args(["--", cmd])
         .args(args)
         .env("ARAPUCA_WRAPPER", "1")
+        // Direct wrapper invocation: declare that no caller extra_fds cross.
+        .env("ARAPUCA_TARGET_FDS", "0")
         .env("ARAPUCA_READ_PATHS", read_paths)
         .env("ARAPUCA_WRITE_PATHS", write_paths)
         .output()
@@ -42,6 +44,8 @@ fn seccomp_only_command(cmd: &str, args: &[&str]) -> std::process::Output {
         .args(["--", cmd])
         .args(args)
         .env("ARAPUCA_WRAPPER", "1")
+        // Direct wrapper invocation: declare that no caller extra_fds cross.
+        .env("ARAPUCA_TARGET_FDS", "0")
         .env(
             "ARAPUCA_READ_PATHS",
             "/usr:/lib:/lib64:/bin:/sbin:/etc:/dev:/proc:/tmp",
@@ -185,6 +189,8 @@ fn env_stripping() {
     let output = Command::new(arapuca_bin())
         .args(["--", "/bin/sh", "-c", "env | grep ARAPUCA_ || echo CLEAN"])
         .env("ARAPUCA_WRAPPER", "1")
+        // Direct wrapper invocation: declare that no caller extra_fds cross.
+        .env("ARAPUCA_TARGET_FDS", "0")
         .env("ARAPUCA_READ_PATHS", "/usr:/lib:/lib64:/bin:/etc:/dev")
         .env("ARAPUCA_WRITE_PATHS", "/tmp")
         .env("ARAPUCA_SECRET", "should-not-leak")
@@ -203,6 +209,8 @@ fn non_arapuca_env_preserved() {
     let output = Command::new(arapuca_bin())
         .args(["--", "/bin/sh", "-c", "echo $AGENT_TEST_VAR"])
         .env("ARAPUCA_WRAPPER", "1")
+        // Direct wrapper invocation: declare that no caller extra_fds cross.
+        .env("ARAPUCA_TARGET_FDS", "0")
         .env("ARAPUCA_READ_PATHS", "/usr:/lib:/lib64:/bin:/etc:/dev")
         .env("ARAPUCA_WRITE_PATHS", "/tmp")
         .env("AGENT_TEST_VAR", "preserved")

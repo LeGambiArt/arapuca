@@ -520,3 +520,77 @@ mod capdrop_tests {
         drop_capabilities().expect("capset drop must succeed");
     }
 }
+
+/// Descriptor window the target may inherit, as conveyed by the
+/// launcher through `ARAPUCA_TARGET_FDS`.
+///
+/// The launcher remaps the caller's `extra_fds` to `[3, 3+E)`. The
+/// wrapper path is only reachable with `ARAPUCA_WRAPPER=1`, so a
+/// missing or malformed value is a launcher/wrapper mismatch and must
+/// fail closed — treating it as `E = 0` would silently close
+/// descriptors the caller explicitly asked to hand over.
+#[cfg(target_os = "linux")]
+pub fn target_fds_from_env() -> crate::Result<i32> {
+    let max = crate::platform::fd::MAX_TARGET_FDS;
+    let raw = std::env::var(crate::platform::fd::TARGET_FDS_ENV).map_err(|_| {
+        crate::Error::Validation(format!(
+            "{} not set — launcher/wrapper mismatch",
+            crate::platform::fd::TARGET_FDS_ENV
+        ))
+    })?;
+    let n: i32 = raw.trim().parse().map_err(|_| {
+        crate::Error::Validation(format!(
+            "invalid {}: {raw:?}",
+            crate::platform::fd::TARGET_FDS_ENV
+        ))
+    })?;
+    if !(0..=max).contains(&n) {
+        return Err(crate::Error::Validation(format!(
+            "{} out of range: {n} (0..={max})",
+            crate::platform::fd::TARGET_FDS_ENV
+        )));
+    }
+    Ok(n)
+}
+
+/// Descriptor limit as it stands *now*.
+///
+/// The blind fallback in [`sweep_inherited_fds`] needs a bound, and the
+/// caller must capture it before `rlimit::apply_from_env` lowers
+/// `RLIMIT_NOFILE`; descriptors above a lowered bound would otherwise
+/// escape the sweep.
+#[cfg(target_os = "linux")]
+pub fn nofile_bound() -> i32 {
+    let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: getrlimit with a valid rlimit pointer.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+    if rc == 0 {
+        rl.rlim_cur.min(65_536) as i32
+    } else {
+        4_096
+    }
+}
+
+/// Sweep descriptors outside `[3, keep_end)`.
+///
+/// `hard_close` selects between closing them (immediately before
+/// `execve`) and marking them close-on-exec (where the surviving set is
+/// still being assembled). See [`crate::platform::fd::sweep_inherited`].
+#[cfg(target_os = "linux")]
+pub fn sweep_inherited_fds(
+    keep_end: i32,
+    hard_close: bool,
+    nofile_bound: i32,
+) -> std::io::Result<()> {
+    use crate::platform::fd::{SweepMode, sweep_inherited};
+    let mode = if hard_close {
+        SweepMode::HardClose
+    } else {
+        SweepMode::MarkCloexec
+    };
+    sweep_inherited(keep_end, mode, nofile_bound)
+}
+
+/// First descriptor the target may inherit.
+#[cfg(target_os = "linux")]
+pub const TARGET_FD_BASE: i32 = crate::platform::fd::TARGET_FD_BASE;

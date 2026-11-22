@@ -147,11 +147,42 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Descriptor hygiene. `target_fds` delimits the window the launcher
+    // remapped the caller's extra_fds into; `nofile_bound` must be read
+    // before rlimit::apply_from_env lowers RLIMIT_NOFILE, or the sweep's
+    // blind fallback cannot reach descriptors above the new bound.
+    #[cfg(target_os = "linux")]
+    let (target_fds, fd_nofile_bound) = {
+        let n = arapuca::wrapper::target_fds_from_env().unwrap_or_else(|e| {
+            eprintln!("arapuca: {e}");
+            std::process::exit(1);
+        });
+        (n, arapuca::wrapper::nofile_bound())
+    };
+
     #[cfg(target_os = "linux")]
     if let Err(e) = arapuca::wrapper::close_wrapper_exec_fd() {
         eprintln!("arapuca: {e}");
         std::process::exit(1);
     }
+    // Mark everything the launcher did not hand over close-on-exec.
+    // execve resets PR_SET_DUMPABLE, so the launcher's dumpable=0 does
+    // not survive into this process; without this the caller's
+    // descriptors stay readable through /proc/<wrapper>/fd for the whole
+    // Landlock/bridge/pidns/seccomp sequence below. Marking (rather than
+    // closing) leaves the internal pipes usable for the rest of the run.
+    // The caller's own window stays unmarked: nothing after this point
+    // re-enables it, so marking it would close it at the final execve.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = arapuca::wrapper::sweep_inherited_fds(
+        arapuca::wrapper::TARGET_FD_BASE + target_fds,
+        false,
+        fd_nofile_bound,
+    ) {
+        eprintln!("arapuca: fd sweep: {e}");
+        std::process::exit(1);
+    }
+
     let deny_unix_sockets = arapuca::wrapper::deny_unix_sockets_from_env().unwrap_or_else(|e| {
         eprintln!("arapuca: {e}");
         std::process::exit(1);
@@ -689,6 +720,21 @@ fn main() {
             if let Err(e) = arapuca::wrapper::scrub_capabilities_for_exec() {
                 eprintln!("arapuca: {e}");
                 std::process::exit(1);
+            }
+
+            // Nothing but the caller's extra_fds may cross into the
+            // target. Hard-close everything else; the internal pipes were
+            // closed above and the audit/pid-report/pinned descriptors are
+            // deliberate exceptions handled before this point.
+            #[cfg(target_os = "linux")]
+            {
+                let keep_end = arapuca::wrapper::TARGET_FD_BASE + target_fds;
+                if let Err(e) =
+                    arapuca::wrapper::sweep_inherited_fds(keep_end, true, fd_nofile_bound)
+                {
+                    eprintln!("arapuca: fd sweep before exec: {e}");
+                    std::process::exit(1);
+                }
             }
 
             let ret = libc::execve(c_cmd.as_ptr(), argv.as_ptr(), envp.as_ptr());

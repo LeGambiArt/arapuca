@@ -526,6 +526,14 @@ impl Sandbox for Linux {
         if let Some(fd) = wrapper_exec_fd {
             command.env("ARAPUCA_WRAPPER_EXEC_FD", fd.to_string());
         }
+        if use_wrapper {
+            // The wrapper sweeps inherited descriptors immediately
+            // before execve; E delimits the caller's extra_fds window.
+            // Always set, even to 0: the wrapper requires it, so a
+            // launcher/wrapper version skew fails closed instead of
+            // silently sweeping descriptors the caller asked for.
+            command.env(super::fd::TARGET_FDS_ENV, cfg.extra_fds.len().to_string());
+        }
 
         // Validate extra FDs before PTY allocation so that validation
         // failures cannot leak openpty FDs.
@@ -1059,6 +1067,21 @@ impl Sandbox for Linux {
         // calls (setsid, prctl) and fd::remap_fds (fcntl, dup2, close).
         // ManuallyDrop prevents free() on the Vec in the child process.
         let parent_pid = unsafe { libc::getpid() };
+        // Captured before the child can lower RLIMIT_NOFILE (the wrapper
+        // applies ARAPUCA_RLIMIT_NOFILE, which defaults to 1024), so the
+        // blind fallback in fd::sweep_inherited still reaches descriptors
+        // above the lowered bound. Clamped because rlim_cur may be
+        // fs.nr_open, far past i32.
+        let nofile_bound = {
+            let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+            // SAFETY: getrlimit with a valid rlimit pointer.
+            let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+            if rc == 0 {
+                rl.rlim_cur.min(65_536) as i32
+            } else {
+                4_096
+            }
+        };
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
@@ -1070,6 +1093,21 @@ impl Sandbox for Linux {
                 if libc::getppid() != parent_pid {
                     libc::_exit(1);
                 }
+
+                // Descriptors the caller holds without CLOEXEC would
+                // otherwise reach the target: nothing past this point
+                // sweeps them, and Rust's Command only marks what it
+                // opens itself. Marking them close-on-exec is enough —
+                // remap_fds re-enables the caller's extra_fds,
+                // inherit_exec_fd re-enables the pinned wrapper
+                // descriptor, and the PTY slave is dup2'd onto stdio
+                // below. Placed after the pdeathsig re-check so a sweep
+                // that blocks cannot leave the child orphaned.
+                super::fd::sweep_inherited(
+                    super::fd::TARGET_FD_BASE,
+                    super::fd::SweepMode::MarkCloexec,
+                    nofile_bound,
+                )?;
                 if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }

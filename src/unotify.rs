@@ -2993,6 +2993,28 @@ pub fn run_supervisor_mode(args: &[String]) -> ! {
     // SAFETY: close the fork-child-side socketpair end.
     unsafe { libc::close(sp_child) };
 
+    // The caller's extra_fds window ([3, 3+E)) is for the TARGET; the
+    // fork child passes it through to the wrapper. Holding copies for
+    // the supervisor's whole lifetime breaks close-to-signal
+    // readiness patterns: a caller waiting for EOF on a passed pipe
+    // never sees it while the target lives. The relay already closes
+    // this range; the supervisor parent now does too. Nothing the
+    // supervisor keeps lives in the window — its pipes and the
+    // pinned fd all sit above it.
+    {
+        let target_fds = std::env::var("ARAPUCA_TARGET_FDS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0);
+        for fd in
+            crate::wrapper::TARGET_FD_BASE..crate::wrapper::TARGET_FD_BASE + target_fds.clamp(0, 16)
+        {
+            // SAFETY: fd is an integer; EBADF from an already-closed
+            // descriptor is ignored.
+            unsafe { libc::close(fd) };
+        }
+    }
+
     // Fd hygiene (the plan's F4 closed-list): the supervisor is NOT
     // the writer of the wrapper-audit or DNS-audit pipes — the
     // wrapper is. Holding their write ends for the supervisor's
