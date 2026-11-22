@@ -204,7 +204,18 @@ fn a_requested_descriptor_above_1024_reaches_the_target() {
     std::fs::write(&path, b"highfd").unwrap();
     let file = std::fs::File::open(&path).unwrap();
     // The old sweep ceiling was 1024; a caller descriptor above it has to
-    // survive the sweep or the fix would silently drop it.
+    // survive the sweep or the fix would silently drop it. Containers
+    // default to a 1024 soft NOFILE, so raise it here first — the
+    // oracle is the fd number, not the host's limit.
+    {
+        let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: getrlimit with a valid rlimit pointer.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 && rl.rlim_max > 4096 {
+            rl.rlim_cur = rl.rlim_max.min(4096);
+            // SAFETY: setrlimit raising only the soft limit.
+            let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) };
+        }
+    }
     let high = dup_at_least(file.as_raw_fd(), 1500);
 
     let mut cfg = config(dir.path());
