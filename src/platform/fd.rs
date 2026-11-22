@@ -375,3 +375,248 @@ mod tests {
         assert_eq!(code, 42, "CLOEXEC should be cleared after remap");
     }
 }
+
+// The sweep below is Linux-only: it is built on close_range(2), which
+// no other platform in this crate has, and every caller is already
+// behind #[cfg(target_os = "linux")]. Gating the items themselves
+// keeps a non-Linux build from seeing references to symbols that do
+// not exist there.
+
+/// Number of descriptors the launcher may hand to the target: the
+/// caller's `extra_fds`, remapped to `[3, 3+E)` by [`remap_fds`].
+///
+/// The internal pipes the launcher adds (audit, DNS audit, unotify,
+/// pid report, cgroup sync) sit *above* that window and are consumed
+/// by the wrapper itself, never by the target.
+#[cfg(target_os = "linux")]
+pub(crate) const TARGET_FD_BASE: i32 = 3;
+
+/// `ARAPUCA_TARGET_FDS` carries `E` to the wrapper. The wrapper path is
+/// only reachable with `ARAPUCA_WRAPPER=1`, so the variable is required
+/// there and a missing value is a version-skew error, never a silent
+/// "sweep everything".
+#[cfg(target_os = "linux")]
+pub(crate) const TARGET_FDS_ENV: &str = "ARAPUCA_TARGET_FDS";
+
+/// Upper bound on `E`, mirroring [`MAX_EXTRA_FDS`]. Kept in sync by the
+/// unit test below.
+#[cfg(target_os = "linux")]
+pub(crate) const MAX_TARGET_FDS: i32 = MAX_EXTRA_FDS as i32;
+
+/// How [`sweep_inherited`] disposes of the descriptors it does not keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+pub(crate) enum SweepMode {
+    /// Set close-on-exec, leaving the descriptors usable. Used where the
+    /// final keep-set is not known yet (the launcher, before
+    /// [`remap_fds`] decides which descriptors survive).
+    MarkCloexec,
+    /// Close them outright. Used immediately before `execve`.
+    HardClose,
+}
+
+/// Mark or close every descriptor `>= TARGET_FD_BASE` outside
+/// `[TARGET_FD_BASE, keep_end)`.
+///
+/// Prefers `close_range(2)`, which needs no bound and reaches the whole
+/// descriptor space. Falls back to a blind `fcntl`/`close` loop bounded
+/// by `nofile_bound` on kernels older than 5.9, or where
+/// `CLOSE_RANGE_CLOEXEC` is unsupported (5.9/5.10).
+///
+/// Async-signal-safe: only `syscall`, `fcntl` and `close` are used, so
+/// this may run inside a `pre_exec` closure. The caller must pass a
+/// `nofile_bound` captured *before* any descriptor limit is lowered —
+/// descriptors above a lowered bound would otherwise escape the
+/// fallback.
+#[cfg(target_os = "linux")]
+pub(crate) fn sweep_inherited(
+    keep_end: i32,
+    mode: SweepMode,
+    nofile_bound: i32,
+) -> std::io::Result<()> {
+    let keep_end = keep_end.max(TARGET_FD_BASE);
+    let flags = match mode {
+        SweepMode::MarkCloexec => CLOSE_RANGE_CLOEXEC,
+        SweepMode::HardClose => 0,
+    };
+
+    // Everything above the keep window — the part a fixed 1024-style
+    // ceiling used to miss.
+    match close_range(keep_end as u32, u32::MAX, flags) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Fall back on ANY failure, matching
+            // bridge::close_fds_except: seccomp profiles that EPERM
+            // unknown syscalls (older Docker/snap confinement,
+            // systemd SystemCallFilter=) answer EPERM for
+            // close_range, and aborting the launch there turns a
+            // complete fallback sweep into a hard failure.
+            fallback_sweep(keep_end, nofile_bound, mode);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const CLOSE_RANGE_CLOEXEC: u32 = 4;
+
+#[cfg(target_os = "linux")]
+fn close_range(first: u32, last: u32, flags: u32) -> std::io::Result<()> {
+    if first > last {
+        return Ok(());
+    }
+    // SAFETY: close_range takes three plain integers and touches no
+    // caller memory.
+    let ret = unsafe { libc::syscall(libc::SYS_close_range, first, last, flags) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Blind sweep used when `close_range(2)` is unavailable.
+///
+/// A `/proc/self/fd` enumeration is not an option here: it allocates,
+/// which is not async-signal-safe after `fork`, and the wrapper paths
+/// run under Landlock, which denies `/proc` (see `pidns.rs`).
+#[cfg(target_os = "linux")]
+fn fallback_sweep(keep_end: i32, nofile_bound: i32, mode: SweepMode) {
+    let end = nofile_bound.max(keep_end);
+    for fd in keep_end..end {
+        match mode {
+            SweepMode::HardClose => {
+                // SAFETY: closing an unopened descriptor is a no-op
+                // (EBADF), so the result is intentionally ignored.
+                unsafe { libc::close(fd) };
+            }
+            SweepMode::MarkCloexec => {
+                // SAFETY: F_GETFD/F_SETFD are plain flag operations.
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                if flags >= 0 {
+                    // SAFETY: same as above.
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod sweep_tests {
+    use super::*;
+
+    fn pipe2() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        // SAFETY: pipe2 with a valid two-element array.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), 0) }, 0);
+        (fds[0], fds[1])
+    }
+
+    /// Duplicate `fd` onto the lowest *free* descriptor `>= min`.
+    ///
+    /// Never use a fixed number here: the test process is shared with
+    /// every other test, and `dup2` onto an occupied descriptor closes
+    /// whatever was there.
+    fn dup_at_least(fd: i32, min: i32) -> i32 {
+        // SAFETY: F_DUPFD with a valid descriptor and bound.
+        let out = unsafe { libc::fcntl(fd, libc::F_DUPFD, min) };
+        assert!(out >= min, "F_DUPFD({min}) -> {out}");
+        out
+    }
+
+    /// Run `body` in a forked child and report whether it returned true.
+    ///
+    /// A sweep touches the whole descriptor space of the process it runs
+    /// in (and only that process), so it must not run in the shared test
+    /// process: closing a sibling test's descriptor is exactly the bug
+    /// these functions exist to prevent.
+    fn in_forked_child(body: impl FnOnce() -> bool) -> bool {
+        // SAFETY: fork in a test; the child runs only syscalls and
+        // `_exit`, so no allocation or locking happens after fork.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let ok = body();
+            // SAFETY: _exit skips atexit handlers and buffer flushes.
+            unsafe { libc::_exit(i32::from(!ok)) };
+        }
+        let mut status = 0i32;
+        // SAFETY: waitpid on the child just forked.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
+
+    fn fd_flags(fd: i32) -> i32 {
+        // SAFETY: plain flag query.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) }
+    }
+
+    #[test]
+    fn target_fd_bound_tracks_the_extra_fd_bound() {
+        // The wrapper validates ARAPUCA_TARGET_FDS against MAX_TARGET_FDS;
+        // if the extra-fd ceiling moved without this one, a launcher could
+        // pass a window the wrapper rejects.
+        assert_eq!(MAX_TARGET_FDS, MAX_EXTRA_FDS as i32);
+    }
+
+    #[test]
+    fn mark_cloexec_keeps_descriptors_usable() {
+        assert!(
+            in_forked_child(|| {
+                let (_r, w) = pipe2();
+                // Two descriptors well above the keep window.
+                let kept = dup_at_least(w, 64);
+                let other = dup_at_least(w, kept + 1);
+                if sweep_inherited(TARGET_FD_BASE, SweepMode::MarkCloexec, 1024).is_err() {
+                    return false;
+                }
+                // Still open (flagged, not closed) and flagged.
+                fd_flags(kept) >= 0
+                    && fd_flags(other) >= 0
+                    && fd_flags(kept) & libc::FD_CLOEXEC != 0
+                    && fd_flags(other) & libc::FD_CLOEXEC != 0
+            }),
+            "a marking sweep must set CLOEXEC without closing anything"
+        );
+    }
+
+    #[test]
+    fn hard_close_removes_everything_outside_the_window() {
+        assert!(
+            in_forked_child(|| {
+                let (_r, w) = pipe2();
+                // `keep_end` sits just above the pipe's own descriptors:
+                // nothing survives, including the descriptor far above it.
+                let far = dup_at_least(w, 512);
+                if sweep_inherited(TARGET_FD_BASE, SweepMode::HardClose, 1024).is_err() {
+                    return false;
+                }
+                fd_flags(far) == -1
+            }),
+            "descriptors outside the keep window must be closed"
+        );
+    }
+
+    #[test]
+    fn hard_close_spares_the_keep_window() {
+        assert!(
+            in_forked_child(|| {
+                let (_r, w) = pipe2();
+                let keep_end = dup_at_least(w, 64);
+                let kept = keep_end - 1;
+                // SAFETY: dup2 onto the free slot just below the window end.
+                if unsafe { libc::dup2(w, kept) } != kept {
+                    return false;
+                }
+                let outside = dup_at_least(w, keep_end + 1);
+                if sweep_inherited(keep_end, SweepMode::HardClose, 1024).is_err() {
+                    return false;
+                }
+                fd_flags(kept) >= 0 && fd_flags(outside) == -1
+            }),
+            "the keep window must survive a hard-close sweep"
+        );
+    }
+}

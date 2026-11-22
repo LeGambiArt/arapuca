@@ -240,6 +240,8 @@ fn wrapper_with_sentinel_and_paths_succeeds() {
     let output = Command::new(arapuca_bin())
         .args(["--", "/bin/true"])
         .env("ARAPUCA_WRAPPER", "1")
+        // Direct wrapper invocation: declare that no caller extra_fds cross.
+        .env("ARAPUCA_TARGET_FDS", "0")
         .env("ARAPUCA_READ_PATHS", "/usr:/lib:/lib64:/bin")
         .env("ARAPUCA_WRITE_PATHS", "/tmp")
         .output()

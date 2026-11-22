@@ -112,6 +112,8 @@ fn malformed_policy_transport_prevents_execution() {
     let out = Command::new(binary())
         .args(["--", "/bin/echo", "TARGET_EXECUTED"])
         .env("ARAPUCA_WRAPPER", "1")
+        // Direct wrapper invocation: declare that no caller extra_fds cross.
+        .env("ARAPUCA_TARGET_FDS", "0")
         .env("ARAPUCA_DENY_UNIX_SOCKETS", "bad")
         .output()
         .unwrap();
@@ -214,6 +216,8 @@ fn selfexec_constructor_enforces_policy() {
     let out = Command::new(std::env::current_exe().unwrap())
         .args(["--", "/usr/bin/python3", "-c", SOCKET_PROBE])
         .env("ARAPUCA_WRAPPER", "1")
+        // Direct wrapper invocation: declare that no caller extra_fds cross.
+        .env("ARAPUCA_TARGET_FDS", "0")
         .env("ARAPUCA_DENY_UNIX_SOCKETS", "1")
         .env("ARAPUCA_ALLOW_EXEC", "1")
         .env("ARAPUCA_READ_PATHS", "/usr:/lib:/lib64:/bin:/etc")
@@ -361,6 +365,8 @@ fn selfexec_constructor_keeps_unotify_and_pid_namespace_functional() {
         .arg(std::env::current_exe().unwrap())
         .args(["--", "/usr/bin/python3", "-c", SOCKET_PROBE])
         .env("ARAPUCA_WRAPPER", "1")
+        // Direct wrapper invocation: declare that no caller extra_fds cross.
+        .env("ARAPUCA_TARGET_FDS", "0")
         .env("ARAPUCA_DENY_UNIX_SOCKETS", "1")
         .env("ARAPUCA_ALLOW_EXEC", "1")
         .env("ARAPUCA_READ_PATHS", "/usr:/lib:/lib64:/bin:/etc:/proc")
@@ -492,6 +498,8 @@ fn selfexec_constructor_keeps_the_delegated_bridge_functional() {
         .arg(std::env::current_exe().unwrap())
         .args(["--", "/usr/bin/python3", "-c", &script])
         .env("ARAPUCA_WRAPPER", "1")
+        // Direct wrapper invocation: declare that no caller extra_fds cross.
+        .env("ARAPUCA_TARGET_FDS", "0")
         .env("ARAPUCA_DENY_UNIX_SOCKETS", "1")
         .env("ARAPUCA_ALLOW_EXEC", "1")
         .env("ARAPUCA_READ_PATHS", "/usr:/lib:/lib64:/bin:/etc")

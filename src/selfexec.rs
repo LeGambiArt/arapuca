@@ -536,6 +536,10 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
     }
 
     // ── Rlimits ──────────────────────────────────────────────────
+    // Captured before apply_from_env lowers RLIMIT_NOFILE, so the exec
+    // sweep's blind fallback still reaches descriptors above the bound.
+    #[cfg(target_os = "linux")]
+    let nofile_bound = crate::wrapper::nofile_bound();
     #[cfg(unix)]
     if let Err(e) = crate::rlimit::apply_from_env() {
         audit_layer(audit_fd, "Rlimit", false, Some(&e.to_string()));
@@ -628,6 +632,26 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         if let Err(e) = crate::wrapper::scrub_capabilities_for_exec() {
             write_stderr(&format!("arapuca: selfexec: {e}\n"));
             libc::_exit(1);
+        }
+
+        // Nothing but the caller's extra_fds may cross into the target.
+        // The launcher already marked every other descriptor
+        // close-on-exec; this closes them outright, so a descriptor the
+        // trampoline opened on the way here cannot ride along either.
+        #[cfg(target_os = "linux")]
+        {
+            let target_fds = match crate::wrapper::target_fds_from_env() {
+                Ok(n) => n,
+                Err(e) => {
+                    write_stderr(&format!("arapuca: selfexec: {e}\n"));
+                    libc::_exit(1);
+                }
+            };
+            let keep_end = crate::wrapper::TARGET_FD_BASE + target_fds;
+            if let Err(e) = crate::wrapper::sweep_inherited_fds(keep_end, true, nofile_bound) {
+                write_stderr(&format!("arapuca: selfexec: fd sweep: {e}\n"));
+                libc::_exit(1);
+            }
         }
 
         libc::execve(c_cmd.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr());
