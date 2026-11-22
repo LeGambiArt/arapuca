@@ -2125,6 +2125,15 @@ fn fork_connect_proxy(
             unsafe { libc::_exit(1) };
         }
 
+        // The proxy never execs and needs no capabilities; drop them
+        // so a cap-bearing helper cannot be pivoted through
+        // /proc/<pid>/mem (capabilities bypass dumpability). The
+        // library-side twin in bridge.rs has always done this.
+        if let Err(e) = arapuca::wrapper::drop_capabilities() {
+            eprintln!("arapuca run: proxy cap drop: {e}");
+            unsafe { libc::_exit(1) };
+        }
+
         // Apply Landlock with minimal NSS paths. The proxy needs to
         // read resolver config and load NSS modules, but should not
         // have access to the broader filesystem.
