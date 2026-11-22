@@ -302,7 +302,7 @@ fn enabled_policy_keeps_unotify_and_pid_namespace_functional() {
         .is_ok_and(|s| s.success())
     {
         eprintln!(
-            "SKIP: user/PID namespaces unavailable; enabled-policy unotify remains unverified"
+            "skipping: user/PID namespaces unavailable; enabled-policy unotify remains unverified"
         );
         return;
     }
@@ -349,7 +349,7 @@ fn selfexec_constructor_keeps_unotify_and_pid_namespace_functional() {
         .status()
         .is_ok_and(|s| s.success())
     {
-        eprintln!("SKIP: user/PID namespaces unavailable; selfexec unotify remains unverified");
+        eprintln!("skipping: user/PID namespaces unavailable; selfexec unotify remains unverified");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -398,7 +398,9 @@ fn enabled_policy_keeps_the_delegated_tcp_to_unix_bridge_functional() {
         .status()
         .is_ok_and(|s| s.success())
     {
-        eprintln!("SKIP: network namespace unavailable; enabled-policy bridge remains unverified");
+        eprintln!(
+            "skipping: network namespace unavailable; enabled-policy bridge remains unverified"
+        );
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -455,7 +457,7 @@ fn selfexec_constructor_keeps_the_delegated_bridge_functional() {
         .status()
         .is_ok_and(|s| s.success())
     {
-        eprintln!("SKIP: network namespace unavailable; selfexec bridge remains unverified");
+        eprintln!("skipping: network namespace unavailable; selfexec bridge remains unverified");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -527,7 +529,7 @@ fn retained_sqpoll_ring_with_hidden_unix_socket_is_rejected() {
             "{e}"
         );
         eprintln!(
-            "SKIP: SQPOLL setup unavailable ({e}); inherited-ring runtime control remains unverified"
+            "skipping: SQPOLL setup unavailable ({e}); inherited-ring runtime control remains unverified"
         );
         return;
     }
@@ -759,4 +761,44 @@ fn compatibility_gate_and_enforcement_oracle_cover_version_skew() {
         );
         assert!(String::from_utf8_lossy(&out.stdout).contains("WRAPPER_CONTRACT_CHECKED"));
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn no_unix_sockets_combines_with_connect_policy() {
+    // The supervisor topology hands the wrapper one AF_UNIX
+    // socketpair end (ARAPUCA_UNOTIFY_SP_FD) before the wrapper's
+    // deny-unix-sockets validation runs; without the exemption for
+    // that one descriptor, every launch with both flags failed. This
+    // is the non-serde CLI form of the combination (the library-side
+    // variant is the serde-gated test above).
+    if !Command::new("unshare")
+        .args(["--user", "--net", "--map-root-user", "--", "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        eprintln!("skipping: user/PID namespaces unavailable");
+        return;
+    }
+    let out = Command::new(binary())
+        .args([
+            "run",
+            "--no-unix-sockets",
+            "--deny-privileged-unix-sockets",
+            "--seccomp",
+            "baseline",
+            "--",
+        ])
+        .arg("/bin/echo")
+        .arg("COMBINATION_OK")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("COMBINATION_OK"),
+        "--no-unix-sockets with the connect policy must launch: {stdout}\nstderr: {stderr}"
+    );
 }

@@ -1503,3 +1503,65 @@ sys.exit(0)
         "the grandchild's connects must reach the listener (got {n})"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn uds_policy_availability_follows_yama_scope() {
+    // Parent topology: the supervisor inspects its descendant, so
+    // plain (no-userns) policy runs are enforced at Yama scopes
+    // 0-1 and refused fail-closed at 2+ (scope 2 without caps
+    // denies even parent→child; scope 3 denies everything). Both
+    // directions are asserted so a regression either way — wrongly
+    // refusing a capable host, or running unenforced on a denied
+    // one — turns red.
+    let scope = yama_scope();
+    if scope <= 1 {
+        // Capable host: the plain run must SUCCEED (enforced), not
+        // be refused. (The child-topology-era oracle inverted this.)
+        let out = Command::new(arapuca_bin())
+            .args([
+                "run",
+                "--seccomp",
+                "baseline",
+                "--deny-privileged-unix-sockets",
+                "--",
+                "/bin/true",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "plain policy run must be enforced (not refused) at yama scope {scope}: {stderr}"
+        );
+        return;
+    }
+    // Scope >= 2: the plain run must be refused fail-closed (the
+    // opt-out named), never run unenforced.
+    let out = Command::new(arapuca_bin())
+        .args([
+            "run",
+            "--seccomp",
+            "baseline",
+            "--deny-privileged-unix-sockets",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "launch must fail closed: {stderr}"
+    );
+    assert!(
+        stderr.contains("unix socket connect policy"),
+        "error must name the policy: {stderr}"
+    );
+    assert!(
+        stderr.contains("--allow-unix-socket-connect"),
+        "error must name the opt-out: {stderr}"
+    );
+}

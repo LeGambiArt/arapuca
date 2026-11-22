@@ -115,7 +115,56 @@ impl Sandbox for Linux {
         let use_wrapper = wrapper.is_some();
         let uds_policy_active = cfg.profile.unix_socket_connect_policy
             == crate::profile::UnixSocketConnectPolicy::DenyPrivileged;
-        let pinned_wrapper = if (cfg.profile.deny_unix_sockets || uds_policy_active)
+        // Unotify spawn decision, made HERE because it selects the
+        // command shape: when the supervisor is wanted and the
+        // kernel supports it, the command spawns the arapuca binary
+        // in supervisor mode (which forks + execs the wrapper),
+        // instead of the wrapper directly. Availability is the
+        // parent→child inspection direction the supervisor uses
+        // (no capabilities needed at Yama scopes 0/1; scope 3 denies
+        // everything). The probe result is cached — the later
+        // unotify block consults the same decision.
+        let audit_wants_early = (cfg.profile.audit_file_access || cfg.profile.audit_network)
+            && use_wrapper
+            && cfg!(feature = "serde");
+        // The supervisor runs inside the same unshare the wrapper
+        // gets: under a user namespace it holds capabilities, so
+        // inspection works at Yama scopes 0-2 (only 3 denies). A
+        // plain launch probes the capless parent→child direction.
+        // Every mode here launches under unshare --map-root-user, so
+        // the supervisor it spawns holds user-namespace capabilities:
+        // availability must use the userns-direction probe (Yama
+        // scopes 0-2), not the plain capless parent→child one.
+        let userns_launch = cfg.profile.use_netns
+            || cfg.profile.allow_network_listeners
+            || cfg.network_proxy_socket.is_some()
+            || !cfg.allowed_hosts.is_empty()
+            || cfg.profile.use_pidns;
+        let unotify_available = if userns_launch {
+            crate::unotify::unotify_available_in_userns()
+        } else {
+            crate::unotify::unotify_available()
+        };
+        // The connect policy additionally needs NOTIF_ADDFD
+        // (kernel >= 5.9) for socket delivery — audit-only features
+        // work without it and must not be refused for lacking it.
+        let unotify_supported =
+            unotify_available && (!uds_policy_active || crate::unotify::addfd_available());
+        // Selfexec launches are pinned to the legacy child topology
+        // (the wrapper forks its own supervisor): routing them into
+        // supervisor mode would exec the consumer's own binary with
+        // argv "--supervisor" and no exec fd — the trampoline never
+        // fires, and an argv-tolerant embedder runs its own main()
+        // unsandboxed. The selfexec path enforces the policy itself
+        // (selfexec.rs probes the child-topology direction).
+        let unotify_spawn = use_wrapper
+            && (audit_wants_early || uds_policy_active)
+            && unotify_supported
+            && !crate::selfexec::selfexec_enabled();
+
+        let pinned_wrapper = if (cfg.profile.deny_unix_sockets
+            || uds_policy_active
+            || unotify_spawn)
             && !crate::selfexec::selfexec_enabled()
         {
             let path = wrapper.as_ref().ok_or_else(|| {
@@ -132,6 +181,9 @@ impl Sandbox for Linux {
             let wrapper_path = wrapper.as_ref().unwrap();
             let mut wrapper_args = vec!["--".to_string(), actual_cmd];
             wrapper_args.extend(actual_args);
+            if unotify_spawn {
+                wrapper_args.insert(0, "--supervisor".to_string());
+            }
             actual_cmd = pinned_wrapper
                 .as_ref()
                 .map(|p| p.path())
@@ -659,7 +711,30 @@ impl Sandbox for Linux {
         let audit_wants = (cfg.profile.audit_file_access || cfg.profile.audit_network)
             && use_wrapper
             && cfg!(feature = "serde");
-        let unotify_wants = audit_wants || (uds_policy_active && use_wrapper);
+        let mut unotify_wants = audit_wants || (uds_policy_active && use_wrapper);
+        // Availability was decided at routing time with the
+        // direction-aware probe (scope 2 works under the netns
+        // modes' user namespace; scopes 0/1 work plain; only 3
+        // denies everything). Re-probing here with the plain probe
+        // would wrongly refuse netns runs on Yama-2 hosts and
+        // wrongly clear audit runs whose supervisor is in fact
+        // spawnable (leaving a spawned supervisor with no config —
+        // a dead run).
+        if unotify_wants && !unotify_supported {
+            if uds_policy_active {
+                return Err(Error::Process(
+                    "unix socket connect policy requires seccomp \
+                     user notification with NOTIF_ADDFD support \
+                     (kernel >= 5.9, ptrace access; Yama ptrace_scope=3 \
+                     denies it unconditionally); opt out with \
+                     --allow-unix-socket-connect (policy left unenforced)"
+                        .into(),
+                ));
+            }
+            // Audit-only features keep the lenient skip.
+            log::warn!("unotify: not available on this kernel — skipping supervisor");
+            unotify_wants = false;
+        }
         let mut unotify_audit_pipe = None;
         if unotify_wants {
             let config_env = crate::env::unotify_env(&cfg.profile);
@@ -738,8 +813,10 @@ impl Sandbox for Linux {
         // When PID namespace is active, create a pipe for the wrapper
         // parent to report the target's host PID. Set ARAPUCA_PID_NS
         // so the wrapper knows to call unshare(CLONE_NEWPID) + fork().
-        let pid_report_pipe = if cfg.profile.use_pidns && use_wrapper {
-            command.env("ARAPUCA_PID_NS", "1");
+        let pid_report_pipe = if use_wrapper && (cfg.profile.use_pidns || unotify_spawn) {
+            if cfg.profile.use_pidns {
+                command.env("ARAPUCA_PID_NS", "1");
+            }
             let mut fds = [0i32; 2];
             let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
             if ret == 0 {
@@ -749,13 +826,37 @@ impl Sandbox for Linux {
                 pipe_guard.push(fds[0]);
                 pipe_guard.push(fds[1]);
                 Some((fds[0], fds[1]))
-            } else {
+            } else if cfg.profile.use_pidns {
                 log::warn!("PID report pipe creation failed, continuing without pidns");
                 None
+            } else {
+                // The supervisor launch's pid report is load-bearing
+                // for signaling (pidfd) and the orphan sweep.
+                return Err(Error::Process(
+                    "pid report pipe creation failed for the supervisor launch".into(),
+                ));
             }
         } else {
             None
         };
+
+        // ── Supervisor-mode env (parent topology) ──────────────────
+        // The sentinel gates the internal entry point; the exec fd
+        // makes the supervisor exec the wrapper through the SAME
+        // pinned inode (never a PATH re-lookup); the tty marker
+        // tells the supervisor to hand the foreground group to the
+        // wrapper (terminal signals reach the target, not the
+        // supervisor). ARAPUCA_PID_NS selects the pid-report writer
+        // (relay vs the supervisor itself).
+        if unotify_spawn {
+            command.env("ARAPUCA_SUPERVISOR", "1");
+            if let Some(pinned) = pinned_wrapper.as_ref() {
+                command.env("ARAPUCA_WRAPPER_EXEC_FD", pinned.fd().to_string());
+            }
+            if cfg.tty {
+                command.env("ARAPUCA_SUPERVISOR_TTY", "1");
+            }
+        }
 
         // ── Create cgroup ──────────────────────────────────────────
         let limits = CgroupLimits {
@@ -999,14 +1100,22 @@ impl Sandbox for Linux {
 
                 // PTY slave setup: acquire controlling terminal, then
                 // redirect stdio. TIOCSCTTY runs after setsid() which
-                // is the only valid ordering per POSIX.
+                // is the only valid ordering per POSIX. Under the
+                // supervisor topology the ctty belongs to the WRAPPER
+                // (the supervisor's fork child setsid's and takes it),
+                // not to this process: a supervisor holding the
+                // terminal leaves the target's group un-orphaned, so a
+                // terminal SIGTSTP would stop the target with nobody
+                // to SIGCONT it — a wedge until --timeout.
                 #[cfg(unix)]
                 if let Some(sfd) = slave_fd {
-                    // SAFETY: TIOCSCTTY on the slave PTY. arg=0: do not
-                    // steal from another session (the slave is always
-                    // unowned after openpty + setsid).
-                    if libc::ioctl(sfd, libc::TIOCSCTTY as libc::Ioctl, 0i32) != 0 {
-                        return Err(std::io::Error::last_os_error());
+                    if !unotify_spawn {
+                        // SAFETY: TIOCSCTTY on the slave PTY. arg=0: do
+                        // not steal from another session (the slave is
+                        // always unowned after openpty + setsid).
+                        if libc::ioctl(sfd, libc::TIOCSCTTY as libc::Ioctl, 0i32) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                     if libc::dup2(sfd, 0) == -1 {
                         return Err(std::io::Error::last_os_error());
@@ -1361,6 +1470,7 @@ impl Sandbox for Linux {
             unotify_audit_pipe: unotify_audit_read_fd,
             pidfd,
             target_pid: stored_target_pid,
+            pidns_active: cfg.profile.use_pidns,
             waited: false,
             connect_proxy_pid: connect_proxy_pid_local,
             connect_proxy_pidfd: connect_proxy_pidfd_local,
