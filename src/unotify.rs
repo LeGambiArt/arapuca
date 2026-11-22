@@ -50,6 +50,29 @@ const SECCOMP_IOCTL_NOTIF_SEND: libc::Ioctl = ioc(IOC_WRITE | IOC_READ, 1, 24);
 const SECCOMP_IOCTL_NOTIF_ID_VALID_NEW: libc::Ioctl = ioc(IOC_WRITE, 2, 8);
 const SECCOMP_IOCTL_NOTIF_ID_VALID_OLD: libc::Ioctl = ioc(IOC_READ, 2, 8);
 
+/// `ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD, &seccomp_notif_addfd)` —
+/// install a supervisor-owned fd into the target's fd table.
+///
+/// `struct seccomp_notif_addfd` is 24 bytes (u64 id + u32 flags +
+/// u32 srcfd + u32 newfd + u32 newfd_flags), command nr 3. Not in
+/// libc; computed from the kernel's `_IOW` macro. Kernel ≥ 5.9.
+const SECCOMP_IOCTL_NOTIF_ADDFD: libc::Ioctl = ioc(IOC_WRITE, 3, 24);
+
+/// With `SECCOMP_ADDFD_FLAG_SETFD`, the fd is installed at the
+/// chosen `newfd` number (replacing whatever occupies it) instead of
+/// the lowest free slot.
+const SECCOMP_ADDFD_FLAG_SETFD: u32 = 1 << 0;
+
+/// Argument struct for `SECCOMP_IOCTL_NOTIF_ADDFD`.
+#[repr(C)]
+struct SeccompNotifAddfd {
+    id: u64,
+    flags: u32,
+    srcfd: u32,
+    newfd: u32,
+    newfd_flags: u32,
+}
+
 // ─── BPF construction ─────────────────────────────────────────────
 
 const BPF_LD: u16 = 0x00;
@@ -86,24 +109,52 @@ const fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
 /// 2. Load syscall number
 /// 3. Linear scan: for each target syscall, compare and return USER_NOTIF
 /// 4. Default: return ALLOW
+///
+/// See [`build_unotify_bpf_kill_arch`] for the variant used while the
+/// UDS connect policy is active.
 pub fn build_unotify_bpf(syscalls: &[i64]) -> crate::Result<Vec<libc::sock_filter>> {
+    build_unotify_bpf_impl(syscalls, false)
+}
+
+/// Like [`build_unotify_bpf`], but syscalls entering through a
+/// mismatched architecture (e.g. a 64-bit target issuing `int 0x80`
+/// compat entry, which arrives with AUDIT_ARCH_I386 and bypasses the
+/// broker) are killed instead of allowed.
+///
+/// Used while the UDS connect policy is active: an arch-mismatched
+/// connect() would skip the broker entirely, so the filter must
+/// fail closed. This breaks 32-bit-compat targets under the policy —
+/// accepted.
+pub fn build_unotify_bpf_kill_arch(syscalls: &[i64]) -> crate::Result<Vec<libc::sock_filter>> {
+    build_unotify_bpf_impl(syscalls, true)
+}
+
+fn build_unotify_bpf_impl(
+    syscalls: &[i64],
+    kill_arch: bool,
+) -> crate::Result<Vec<libc::sock_filter>> {
     if syscalls.len() > 127 {
         return Err(Error::Seccomp(format!(
             "unotify BPF: too many syscalls ({}, max 127)",
             syscalls.len()
         )));
     }
-    let mut prog = Vec::with_capacity(4 + syscalls.len() * 2 + 1);
+    // Arch-mismatch target: with kill_arch, mismatched entries (e.g.
+    // int 0x80 compat) must die; the KILL return sits one instruction
+    // past the default ALLOW so it is only reachable via this jump.
+    let extra: u8 = if kill_arch { 1 } else { 0 };
+    let mut prog = Vec::with_capacity(4 + syscalls.len() * 2 + 1 + extra as usize);
 
     // Load seccomp_data.arch (offset 4)
     prog.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, 4));
-    // Check arch matches — skip 1 instruction if match, else jump to ALLOW
+    // Check arch matches — skip 1 instruction if match, else jump to
+    // the mismatch action (ALLOW, or KILL for the kill_arch variant).
     let allow_offset = (syscalls.len() * 2) as u8;
     prog.push(bpf_jump(
         BPF_JMP | BPF_JEQ | BPF_K,
         AUDIT_ARCH,
         0,
-        allow_offset + 1,
+        allow_offset + 1 + extra,
     ));
 
     // Load seccomp_data.nr (offset 0)
@@ -122,6 +173,10 @@ pub fn build_unotify_bpf(syscalls: &[i64]) -> crate::Result<Vec<libc::sock_filte
 
     // Default: ALLOW
     prog.push(bpf_stmt(BPF_RET | BPF_K, 0x7fff_0000)); // SECCOMP_RET_ALLOW
+    if kill_arch {
+        // Arch mismatch: kill (only reachable via the arch-check jump).
+        prog.push(bpf_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS));
+    }
 
     Ok(prog)
 }
@@ -341,6 +396,24 @@ pub enum SockaddrResult {
     ReadFailed,
 }
 
+/// Parse the `sun_path` bytes of an AF_UNIX sockaddr (everything
+/// after the 2-byte family field, length-delimited by the sockaddr
+/// length).
+fn parse_unix_path_bytes(path_bytes: &[u8]) -> UnixSockaddr {
+    if path_bytes.is_empty() {
+        UnixSockaddr::Unnamed
+    } else if path_bytes[0] == 0 {
+        UnixSockaddr::Abstract(path_bytes[1..].to_vec())
+    } else {
+        match path_bytes.iter().position(|&b| b == 0) {
+            Some(end) => {
+                UnixSockaddr::Path(String::from_utf8_lossy(&path_bytes[..end]).into_owned())
+            }
+            None => UnixSockaddr::Unterminated,
+        }
+    }
+}
+
 /// Read a sockaddr from a target process's memory via the cached `MemFd`.
 fn read_sockaddr(mem: &MemFd, addr: u64, addrlen: u64) -> SockaddrResult {
     if addr == 0 || addrlen < 2 {
@@ -424,23 +497,42 @@ fn read_sockaddr(mem: &MemFd, addr: u64, addrlen: u64) -> SockaddrResult {
             // by the sockaddr_un size.
             let path_bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(sa.sun_path.as_ptr().cast::<u8>(), path_len) };
-            if path_bytes.is_empty() {
-                SockaddrResult::Unix(UnixSockaddr::Unnamed)
-            } else if path_bytes[0] == 0 {
-                SockaddrResult::Unix(UnixSockaddr::Abstract(path_bytes[1..].to_vec()))
-            } else {
-                match path_bytes.iter().position(|&b| b == 0) {
-                    Some(end) => SockaddrResult::Unix(UnixSockaddr::Path(
-                        String::from_utf8_lossy(&path_bytes[..end]).into_owned(),
-                    )),
-                    None => SockaddrResult::Unix(UnixSockaddr::Unterminated),
-                }
-            }
+            SockaddrResult::Unix(parse_unix_path_bytes(path_bytes))
         }
         _ => SockaddrResult::NonInet(family),
     }
 }
 
+// ─── UDS connect policy: deny-root matching ───────────────────────
+
+/// Normalize the standard `/var/run` → `/run` symlink alias.
+///
+/// `getpeername()` returns the listener's bind()-time literal path,
+/// not the resolved path, so a daemon that bound
+/// `/var/run/docker.sock` reports that spelling even though the file
+/// lives at `/run/docker.sock` on systemd hosts. Normalizing both
+/// the peer literal and the roots covers the alias class in both
+/// directions.
+fn normalize_run_alias(path: &str) -> String {
+    match path.strip_prefix("/var/run/") {
+        Some(rest) => format!("/run/{rest}"),
+        None => path.to_string(),
+    }
+}
+
+/// Check whether a peer's literal bound path matches a deny root
+/// (equal, or component-wise beneath it).
+fn peer_matches_root(peer: &str, root: &str) -> bool {
+    let peer = normalize_run_alias(peer);
+    let root = normalize_run_alias(root);
+    let root = root.trim_end_matches('/');
+    peer == root || peer.starts_with(&format!("{root}/"))
+}
+
+/// Check whether a peer's literal bound path is denied by any root.
+fn peer_denied(peer: &str, roots: &[String]) -> bool {
+    roots.iter().any(|root| peer_matches_root(peer, root))
+}
 // ─── Notification handler ─────────────────────────────────────────
 
 const SYS_OPENAT2: i64 = 437;
@@ -452,6 +544,9 @@ const SYS_OPENAT2: i64 = 437;
 /// responds with either CONTINUE (observation) or ECONNREFUSED
 /// (network blocking).
 ///
+/// Under the UDS connect policy, `connect()` is routed to
+/// [`broker_connect`] instead: emulation-or-deny, never CONTINUE.
+///
 /// Returns `true` if a response was sent, `false` if the notification
 /// was stale (target exited between recv and send).
 pub fn handle_notification(
@@ -459,28 +554,67 @@ pub fn handle_notification(
     notif: &libc::seccomp_notif,
     audit_fd: RawFd,
     config: &UnotifyConfig,
-    dropped: &mut u64,
+    dropped: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> bool {
     let pid = notif.pid;
     let nr = notif.data.nr as i64;
     let args = &notif.data.args;
 
-    let Some(mem) = MemFd::open(pid) else {
-        return respond_continue(listener_fd, notif);
-    };
+    // Opened once per notification. connect() under the UDS policy
+    // requires it (fail-closed); audit-only syscalls keep the lenient
+    // failure mode below.
+    let mem = MemFd::open(pid);
+
+    match nr {
+        libc::SYS_connect if config.enforce_unix_connect => broker_connect(
+            listener_fd,
+            notif,
+            mem.as_ref(),
+            audit_fd,
+            config,
+            dropped,
+            args[0],
+            args[1],
+            args[2],
+        ),
+        _ => match mem {
+            // Audit-only syscalls tolerate inspection failure.
+            None => respond_continue(listener_fd, notif),
+            Some(mem) => handle_audit_syscall(listener_fd, notif, &mem, audit_fd, config, dropped),
+        },
+    }
+}
+
+/// Dispatch a non-brokered (audit-only) syscall notification.
+///
+/// The `connect`/`sendto`/`sendmsg`/`sendmmsg` arms here implement
+/// the audit-network feature with its documented TOCTOU (netns is
+/// the primary INET boundary); they are not reachable for
+/// `connect()` while the UDS connect policy is active — that path is
+/// handled by [`broker_connect`].
+fn handle_audit_syscall(
+    listener_fd: RawFd,
+    notif: &libc::seccomp_notif,
+    mem: &MemFd,
+    audit_fd: RawFd,
+    config: &UnotifyConfig,
+    dropped: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> bool {
+    let pid = notif.pid;
+    let nr = notif.data.nr as i64;
+    let args = &notif.data.args;
 
     match nr {
         libc::SYS_openat | SYS_OPENAT2 => {
-            // openat(dirfd, pathname, flags, mode)
             // openat2(dirfd, pathname, &open_how, size)
             let path_addr = args[1];
             let flags = if nr == SYS_OPENAT2 {
                 // open_how.flags is the first field (u64)
-                read_u64(&mem, args[2]).unwrap_or(0) as u32
+                read_u64(mem, args[2]).unwrap_or(0) as u32
             } else {
                 args[2] as u32
             };
-            let path = read_string(&mem, path_addr, 2000).unwrap_or_default();
+            let path = read_string(mem, path_addr, 2000).unwrap_or_default();
             let is_write =
                 flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32 != 0;
             write_audit_line(
@@ -498,7 +632,7 @@ pub fn handle_notification(
             // open(pathname, flags, mode) — x86_64 only
             let path_addr = args[0];
             let flags = args[1] as u32;
-            let path = read_string(&mem, path_addr, 2000).unwrap_or_default();
+            let path = read_string(mem, path_addr, 2000).unwrap_or_default();
             let is_write =
                 flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32 != 0;
             write_audit_line(
@@ -519,7 +653,7 @@ pub fn handle_notification(
             } else {
                 args[0]
             };
-            let binary = read_string(&mem, path_addr, 2000).unwrap_or_default();
+            let binary = read_string(mem, path_addr, 2000).unwrap_or_default();
             write_audit_line(
                 audit_fd,
                 dropped,
@@ -535,7 +669,7 @@ pub fn handle_notification(
             handle_connect(
                 listener_fd,
                 notif,
-                &mem,
+                mem,
                 audit_fd,
                 config,
                 dropped,
@@ -553,7 +687,7 @@ pub fn handle_notification(
                 handle_connect(
                     listener_fd,
                     notif,
-                    &mem,
+                    mem,
                     audit_fd,
                     config,
                     dropped,
@@ -568,7 +702,7 @@ pub fn handle_notification(
             handle_sendmsg(
                 listener_fd,
                 notif,
-                &mem,
+                mem,
                 audit_fd,
                 config,
                 dropped,
@@ -590,14 +724,13 @@ pub fn handle_notification(
             let mut block = false;
             for i in 0..vlen {
                 let msghdr_addr = args[1] + i * MMSGHDR_SIZE;
-                if sendmsg_should_block(&mem, msghdr_addr, config) {
+                if sendmsg_should_block(mem, msghdr_addr, config) {
                     // Emit audit event for this blocked destination.
-                    let msg_name = read_u64(&mem, msghdr_addr);
-                    let msg_namelen = read_u32(&mem, msghdr_addr + 8);
+                    let msg_name = read_u64(mem, msghdr_addr);
+                    let msg_namelen = read_u32(mem, msghdr_addr + 8);
                     if let (Some(addr), Some(len)) = (msg_name, msg_namelen) {
                         if addr != 0 && len > 0 {
-                            if let SockaddrResult::Inet(info) =
-                                read_sockaddr(&mem, addr, len as u64)
+                            if let SockaddrResult::Inet(info) = read_sockaddr(mem, addr, len as u64)
                             {
                                 write_audit_line(
                                     audit_fd,
@@ -640,7 +773,7 @@ fn handle_connect(
     mem: &MemFd,
     audit_fd: RawFd,
     config: &UnotifyConfig,
-    dropped: &mut u64,
+    dropped: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     addr: u64,
     addrlen: u64,
     syscall: &str,
@@ -719,7 +852,7 @@ fn handle_sendmsg(
     mem: &MemFd,
     audit_fd: RawFd,
     config: &UnotifyConfig,
-    dropped: &mut u64,
+    dropped: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     msghdr_addr: u64,
     syscall: &str,
 ) -> bool {
@@ -789,6 +922,832 @@ fn read_u32(mem: &MemFd, addr: u64) -> Option<u32> {
         Some(u32::from_ne_bytes(buf))
     } else {
         None
+    }
+}
+
+/// Respond with a successful return value (the kernel returns `val`
+/// without re-executing the syscall).
+fn respond_val(listener_fd: RawFd, notif: &libc::seccomp_notif, val: i64) -> bool {
+    if !notif_id_valid(listener_fd, notif.id) {
+        return false;
+    }
+    let resp = libc::seccomp_notif_resp {
+        id: notif.id,
+        val,
+        error: 0,
+        flags: 0,
+    };
+    notif_send(listener_fd, &resp).is_ok()
+}
+
+// ─── connect() broker (UDS connect policy) ────────────────────────
+//
+// While `enforce_unix_connect` is active, connect() notifications
+// are fully emulated. The kernel never re-executes the syscall (no
+// CONTINUE — the sockaddr buffer and fd table stay live across a
+// CONTINUE, so it is a retryable TOCTOU), the address family is
+// taken from the target's pinned file description (not from the
+// buffer), and the supervisor dials a private socket created with
+// the pinned socket's domain and type. On allow, the verified
+// private socket is installed over the target's fd number via
+// SECCOMP_IOCTL_NOTIF_ADDFD (SETFD); the target's original socket is
+// never connected in any branch (deny, allow, or error), so a
+// sibling thread spinning write() on it only ever sees ENOTCONN.
+
+/// Maximum concurrent connect-completion helper threads. Beyond the
+/// cap, connect notifications are answered EAGAIN (kernel-style
+/// backpressure) rather than stalling the supervisor loop.
+const MAX_CONNECT_HELPERS: usize = 64;
+
+fn active_connect_helpers() -> &'static std::sync::atomic::AtomicUsize {
+    static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &ACTIVE
+}
+
+/// Snapshot a sockaddr (raw bytes) from the target's memory, capped
+/// at `sizeof(sockaddr_storage)` — the kernel rejects anything
+/// longer, and the cap keeps the read inside the caller's buffer.
+fn read_sockaddr_snapshot(mem: &MemFd, addr: u64, addrlen: u64) -> Option<Vec<u8>> {
+    const SOCKADDR_STORAGE_SIZE: u64 = 128;
+    if addr == 0 {
+        return None;
+    }
+    let len = addrlen.min(SOCKADDR_STORAGE_SIZE);
+    let mut buf = vec![0u8; len as usize];
+    if mem.pread(&mut buf, addr) != len as isize {
+        return None;
+    }
+    Some(buf)
+}
+
+/// Resolve a task id to its thread-group leader's pid.
+///
+/// seccomp notifications report the id of the connecting THREAD,
+/// but `pidfd_open` only accepts thread-group leaders (it returns
+/// ENOENT for worker-thread ids). The fd table and address space
+/// are shared across the thread group (CLONE_FILES/CLONE_VM), so
+/// operating on the leader is equivalent for fd duplication and
+/// memory reads. Multi-threaded runtimes (node, bun, JVM, Go)
+/// issue connects from worker threads, making this resolution
+/// load-bearing, not an edge case.
+fn resolve_tgid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Duplicate a file descriptor from the target's fd table. The
+/// kernel resolves the fd number at this moment, pinning the file
+/// description the broker's decision applies to.
+/// The target's FD_CLOEXEC state for `fd`, read from
+/// `/proc/<pid>/fdinfo/<fd>` (the `flags:` octal field,
+/// `02000000` = O_CLOEXEC). Returns None when fdinfo cannot be read.
+fn target_fd_cloexec(pid: u32, fd: u64) -> Option<bool> {
+    let path = format!("/proc/{pid}/fdinfo/{fd}");
+    let info = std::fs::read_to_string(path).ok()?;
+    for line in info.lines() {
+        if let Some(rest) = line.strip_prefix("flags:") {
+            let flags = u32::from_str_radix(rest.trim(), 8).ok()?;
+            // fdinfo reports the O_* open-status mask, where the
+            // close-on-exec bit is O_CLOEXEC (0o2000000) — not
+            // fcntl's FD_CLOEXEC (1).
+            return Some(flags & libc::O_CLOEXEC as u32 != 0);
+        }
+    }
+    None
+}
+
+fn dup_target_fd(pid: u32, fd: u64) -> Option<RawFd> {
+    // SAFETY: pidfd_open/pidfd_getfd on a live notification pid; the
+    // returned fds are closed on every path.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0i32) } as i32;
+    if pidfd < 0 {
+        return None;
+    }
+    let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd as i32, 0u32) } as i32;
+    // SAFETY: pidfd is a valid descriptor from pidfd_open.
+    unsafe { libc::close(pidfd) };
+    if dup < 0 { None } else { Some(dup) }
+}
+
+/// Read an integer socket option (SOL_SOCKET level).
+fn get_sockopt_int(fd: RawFd, opt: libc::c_int) -> std::io::Result<i32> {
+    let mut val: libc::c_int = 0;
+    let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt with valid pointers to stack locals.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            &mut val as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(val)
+}
+
+/// connect(2) on a supervisor-owned fd with the snapshot sockaddr.
+fn connect_snapshot(fd: RawFd, snapshot: &[u8]) -> std::io::Result<()> {
+    // SAFETY: connect with the snapshot buffer as the sockaddr; the
+    // kernel applies its own family/length validation.
+    let ret = unsafe {
+        libc::connect(
+            fd,
+            snapshot.as_ptr() as *const libc::sockaddr,
+            snapshot.len() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The peer's bound address for a connected AF_UNIX socket, as
+/// reported by the kernel (the listener's bind()-time literal).
+fn unix_peer(fd: RawFd) -> Option<UnixSockaddr> {
+    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: getpeername with a zeroed sockaddr_un and its size.
+    let ret = unsafe { libc::getpeername(fd, &mut sa as *mut _ as *mut libc::sockaddr, &mut len) };
+    if ret != 0 {
+        return None;
+    }
+    let path_len = (len as usize).saturating_sub(2).min(sa.sun_path.len());
+    // SAFETY: sun_path is a fixed-size array; path_len is bounded by
+    // the kernel-returned address length and the array size.
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(sa.sun_path.as_ptr().cast::<u8>(), path_len) };
+    Some(parse_unix_path_bytes(bytes))
+}
+
+/// Parse an INET/INET6 sockaddr from the snapshot bytes, using the
+/// fd's domain (kernel truth) to select the layout.
+fn snapshot_inet_info(snapshot: &[u8], domain: i32) -> Option<SockaddrInfo> {
+    match domain {
+        libc::AF_INET if snapshot.len() >= std::mem::size_of::<libc::sockaddr_in>() => {
+            // SAFETY: read_unaligned from a length-checked byte slice.
+            let sa: libc::sockaddr_in =
+                unsafe { std::ptr::read_unaligned(snapshot.as_ptr() as *const libc::sockaddr_in) };
+            let port = u16::from_be(sa.sin_port);
+            let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+            Some(SockaddrInfo {
+                family: libc::AF_INET as u16,
+                destination: format!("{ip}:{port}"),
+                port,
+            })
+        }
+        libc::AF_INET6 if snapshot.len() >= std::mem::size_of::<libc::sockaddr_in6>() => {
+            // SAFETY: read_unaligned from a length-checked byte slice.
+            let sa: libc::sockaddr_in6 =
+                unsafe { std::ptr::read_unaligned(snapshot.as_ptr() as *const libc::sockaddr_in6) };
+            let port = u16::from_be(sa.sin6_port);
+            let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
+            Some(SockaddrInfo {
+                family: libc::AF_INET6 as u16,
+                destination: format!("[{ip}]:{port}"),
+                port,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Emit a `unix_socket_blocked` NDJSON audit line. Called BEFORE the
+/// notification response so a crash between the two cannot skip the
+/// record.
+fn audit_unix_blocked(
+    audit_fd: RawFd,
+    dropped: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pid: u32,
+    path: &str,
+    reason: &str,
+) {
+    write_audit_line(
+        audit_fd,
+        dropped,
+        &format!(
+            "{{\"type\":\"unix_socket_blocked\",\"pid\":{pid},\"path\":\"{}\",\"syscall\":\"connect\",\"reason\":\"{reason}\"}}",
+            escape_for_audit(path),
+        ),
+    );
+}
+
+/// Outcome of installing a verified private socket into the target.
+enum DeliverOutcome {
+    /// The fd was installed; the caller must still send the syscall
+    /// response.
+    Delivered,
+    /// The notification went stale (target exited); no response
+    /// should be sent.
+    Stale,
+    /// The ADDFD ioctl failed while the notification was valid.
+    Failed,
+}
+
+/// Install the verified private socket at the target's fd number via
+/// `SECCOMP_IOCTL_NOTIF_ADDFD` (SETFD), restoring the target's
+/// `O_NONBLOCK` disposition and `FD_CLOEXEC` state on it. Takes
+/// ownership of `private` (closed on every path — the kernel holds
+/// its own reference after a successful install).
+/// Peer verification and delivery for a dialed private socket: the
+/// kernel-returned bind() literal of whatever the private socket
+/// actually connected to, checked against the deny roots, then the
+/// verified socket installed into the target. Shared by the absolute-
+/// and relative-path dial paths.
+#[allow(clippy::too_many_arguments)]
+fn verify_and_deliver(
+    listener_fd: RawFd,
+    notif: &libc::seccomp_notif,
+    private: RawFd,
+    audit_fd: RawFd,
+    config: &UnotifyConfig,
+    dropped: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pid: u32,
+    orig_status_flags: i32,
+    orig_fd_flags: i32,
+    sockfd: libc::c_int,
+) -> bool {
+    match unix_peer(private) {
+        Some(UnixSockaddr::Path(peer)) => {
+            if peer_denied(&peer, &config.unix_deny_roots) {
+                let peer = peer.clone();
+                // SAFETY: private is a valid fd owned here.
+                unsafe { libc::close(private) };
+                audit_unix_blocked(audit_fd, dropped, pid, &peer, "deny-root");
+                return respond_errno(listener_fd, notif, libc::EACCES);
+            }
+        }
+        Some(UnixSockaddr::Abstract(_) | UnixSockaddr::Unnamed) => {
+            // Abstract/unnamed peers never match deny roots.
+        }
+        Some(UnixSockaddr::Unterminated) => {
+            // Structurally odd peer address: fail closed.
+            // SAFETY: private is a valid fd owned here.
+            unsafe { libc::close(private) };
+            audit_unix_blocked(audit_fd, dropped, pid, "", "peer-unterminated");
+            return respond_errno(listener_fd, notif, libc::EACCES);
+        }
+        None => {
+            // SAFETY: private is a valid fd owned here.
+            unsafe { libc::close(private) };
+            audit_unix_blocked(audit_fd, dropped, pid, "", "getpeername-failed");
+            return respond_errno(listener_fd, notif, libc::EACCES);
+        }
+    }
+
+    // Deliver: install the verified socket, respond val=0. Ownership
+    // of `private` transfers to install_delivered_fd.
+    match install_delivered_fd(
+        listener_fd,
+        notif,
+        private,
+        orig_status_flags,
+        orig_fd_flags,
+        sockfd as u32,
+    ) {
+        DeliverOutcome::Delivered => respond_val(listener_fd, notif, 0),
+        DeliverOutcome::Stale => false,
+        DeliverOutcome::Failed => {
+            audit_unix_blocked(audit_fd, dropped, pid, "", "addfd-failed");
+            respond_errno(listener_fd, notif, libc::EACCES)
+        }
+    }
+}
+
+fn install_delivered_fd(
+    listener_fd: RawFd,
+    notif: &libc::seccomp_notif,
+    private: RawFd,
+    orig_status_flags: i32,
+    orig_fd_flags: i32,
+    target_fd: u32,
+) -> DeliverOutcome {
+    // Restore the target's blocking disposition: the private socket
+    // was created SOCK_NONBLOCK for the dial.
+    // SAFETY: fcntl on a valid fd.
+    let cur = unsafe { libc::fcntl(private, libc::F_GETFL) };
+    if cur >= 0 {
+        let want = (cur & !libc::O_NONBLOCK) | (orig_status_flags & libc::O_NONBLOCK);
+        if want != cur {
+            // SAFETY: fcntl on a valid fd.
+            unsafe { libc::fcntl(private, libc::F_SETFL, want) };
+        }
+    }
+    let newfd_flags: u32 = if orig_fd_flags & libc::FD_CLOEXEC != 0 {
+        libc::O_CLOEXEC as u32
+    } else {
+        0
+    };
+
+    if !notif_id_valid(listener_fd, notif.id) {
+        // SAFETY: private is a valid fd owned by this function.
+        unsafe { libc::close(private) };
+        return DeliverOutcome::Stale;
+    }
+
+    let addfd = SeccompNotifAddfd {
+        id: notif.id,
+        flags: SECCOMP_ADDFD_FLAG_SETFD,
+        srcfd: private as u32,
+        newfd: target_fd,
+        newfd_flags,
+    };
+    // SAFETY: ioctl with a valid struct pointer on the listener fd.
+    let ret = unsafe { libc::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd) };
+    // SAFETY: private is a valid fd owned by this function; after a
+    // successful ADDFD the kernel holds its own reference.
+    unsafe { libc::close(private) };
+    if ret < 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno == libc::ENOENT {
+            return DeliverOutcome::Stale;
+        }
+        return DeliverOutcome::Failed;
+    }
+    DeliverOutcome::Delivered
+}
+
+/// Shared state for the connect-completion helper thread.
+struct ConnectHelper {
+    listener_fd: RawFd,
+    audit_fd: RawFd,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    notif: libc::seccomp_notif,
+    private: RawFd,
+    orig_status_flags: i32,
+    orig_fd_flags: i32,
+    target_fd: u32,
+}
+
+impl ConnectHelper {
+    fn finish(&self, result: std::io::Result<()>) -> bool {
+        match result {
+            Ok(()) => match install_delivered_fd(
+                self.listener_fd,
+                &self.notif,
+                self.private,
+                self.orig_status_flags,
+                self.orig_fd_flags,
+                self.target_fd,
+            ) {
+                DeliverOutcome::Delivered => respond_val(self.listener_fd, &self.notif, 0),
+                DeliverOutcome::Stale => false,
+                DeliverOutcome::Failed => {
+                    audit_unix_blocked(
+                        self.audit_fd,
+                        &self.dropped,
+                        self.notif.pid,
+                        "",
+                        "addfd-failed",
+                    );
+                    respond_errno(self.listener_fd, &self.notif, libc::EACCES)
+                }
+            },
+            Err(e) => {
+                // SAFETY: private is a valid fd owned by this helper.
+                unsafe { libc::close(self.private) };
+                respond_errno(
+                    self.listener_fd,
+                    &self.notif,
+                    e.raw_os_error().unwrap_or(libc::EACCES),
+                )
+            }
+        }
+    }
+
+    /// Wait (unbounded, matching blocking-connect semantics) for the
+    /// connect to complete, then deliver.
+    fn run(self) {
+        let mut pfd = libc::pollfd {
+            fd: self.private,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: poll on a valid fd.
+            let ret = unsafe { libc::ppoll(&mut pfd, 1, std::ptr::null_mut(), std::ptr::null()) };
+            if ret >= 0 {
+                break;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                // Pathological poll failure: fail closed.
+                let _ = self.finish(Err(std::io::Error::from_raw_os_error(libc::EACCES)));
+                return;
+            }
+        }
+        let result = match get_sockopt_int(self.private, libc::SO_ERROR) {
+            Ok(0) => Ok(()),
+            Ok(e) => Err(std::io::Error::from_raw_os_error(e)),
+            Err(e) => Err(e),
+        };
+        let _ = self.finish(result);
+    }
+}
+
+/// The connect() broker. See the section comment for the security
+/// rationale. Returns true if a response was sent.
+#[allow(clippy::too_many_arguments)]
+fn broker_connect(
+    listener_fd: RawFd,
+    notif: &libc::seccomp_notif,
+    mem: Option<&MemFd>,
+    audit_fd: RawFd,
+    config: &UnotifyConfig,
+    dropped: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    sockfd: u64,
+    addr: u64,
+    addrlen: u64,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let pid = notif.pid;
+
+    // Fail-closed: any inability to inspect the target denies.
+    let Some(mem) = mem else {
+        audit_unix_blocked(audit_fd, dropped, pid, "", "mem-open-failed");
+        return respond_errno(listener_fd, notif, libc::EACCES);
+    };
+
+    // Notifications report the connecting thread's id; pidfd_open
+    // only accepts thread-group leaders.
+    let Some(tgid) = resolve_tgid(pid) else {
+        audit_unix_blocked(audit_fd, dropped, pid, "", "tgid-resolve-failed");
+        return respond_errno(listener_fd, notif, libc::EACCES);
+    };
+
+    if addr == 0 || addrlen < 2 {
+        // Structurally invalid connect: same answer the kernel gives.
+        return respond_errno(listener_fd, notif, libc::EINVAL);
+    }
+    let Some(snapshot) = read_sockaddr_snapshot(mem, addr, addrlen) else {
+        audit_unix_blocked(audit_fd, dropped, pid, "", "sockaddr-read-failed");
+        return respond_errno(listener_fd, notif, libc::EACCES);
+    };
+
+    let Some(dup) = dup_target_fd(tgid, sockfd) else {
+        audit_unix_blocked(audit_fd, dropped, pid, "", "pidfd-getfd-failed");
+        return respond_errno(listener_fd, notif, libc::EACCES);
+    };
+    // From here on, `dup` must be closed on every exit path.
+
+    // fd identity: the kernel's answer for the pinned file
+    // description, not the sockaddr buffer's family field.
+    let domain = match get_sockopt_int(dup, libc::SO_DOMAIN) {
+        Ok(d) => d,
+        Err(e) => {
+            // SAFETY: dup is a valid fd from pidfd_getfd.
+            unsafe { libc::close(dup) };
+            if e.raw_os_error() == Some(libc::ENOTSOCK) {
+                // Target-visible failure, not a policy bypass.
+                return respond_errno(listener_fd, notif, libc::ENOTSOCK);
+            }
+            audit_unix_blocked(audit_fd, dropped, pid, "", "getsockopt-failed");
+            return respond_errno(listener_fd, notif, libc::EACCES);
+        }
+    };
+    let so_type = match get_sockopt_int(dup, libc::SO_TYPE) {
+        Ok(t) => t,
+        Err(_) => {
+            // SAFETY: dup is a valid fd from pidfd_getfd.
+            unsafe { libc::close(dup) };
+            audit_unix_blocked(audit_fd, dropped, pid, "", "getsockopt-failed");
+            return respond_errno(listener_fd, notif, libc::EACCES);
+        }
+    };
+    // SAFETY: fcntl on a valid fd.
+    let orig_status_flags = unsafe { libc::fcntl(dup, libc::F_GETFL) };
+    // FD_CLOEXEC is per-descriptor, and pidfd_getfd always creates its
+    // copy with CLOEXEC set — reading it from `dup` would report the
+    // supervisor's flag, not the target's, so the delivered socket
+    // would always carry O_CLOEXEC and the target's inheritance
+    // expectations break across its own execve. Read the target's
+    // real flag from its fdinfo instead (openat/read are in the
+    // allowlist and the supervisor already holds ptrace access).
+    let orig_fd_flags = match target_fd_cloexec(pid, sockfd) {
+        Some(cloexec) if cloexec => libc::FD_CLOEXEC,
+        Some(_) => 0,
+        None => {
+            // Unreadable fdinfo: keep the conservative CLOEXEC (the
+            // kernel default for pidfd_getfd) rather than deny the
+            // connect over an fd-info hiccup.
+            libc::FD_CLOEXEC
+        }
+    };
+    if orig_status_flags < 0 {
+        // SAFETY: dup is a valid fd from pidfd_getfd.
+        unsafe { libc::close(dup) };
+        audit_unix_blocked(audit_fd, dropped, pid, "", "fcntl-failed");
+        return respond_errno(listener_fd, notif, libc::EACCES);
+    }
+
+    // Only the families the emulation dials are supported. Other
+    // families (AF_NETLINK, AF_PACKET, ...) are denied WITHOUT
+    // attempting socket(): the supervisor's own seccomp allowlist
+    // family-filters socket(), and an unplanned family would kill the
+    // supervisor (taking every subsequent connect with it — deny by
+    // ENOSYS, but a self-inflicted single point of failure). CONTINUE
+    // is not an option either: the fd-swap and buffer-rewrite races
+    // would reach the AF_UNIX deny decision.
+    if domain != libc::AF_UNIX && domain != libc::AF_INET && domain != libc::AF_INET6 {
+        // SAFETY: dup is a valid fd from pidfd_getfd.
+        unsafe { libc::close(dup) };
+        audit_unix_blocked(audit_fd, dropped, pid, "", "family-unsupported");
+        return respond_errno(listener_fd, notif, libc::EACCES);
+    }
+
+    // Private socket for the dial: same domain and type as the
+    // target's socket, nonblocking for the connect. SO_PROTOCOL keeps
+    // the protocol of the original socket (MPTCP/SCTP otherwise
+    // degrade to plain TCP); SO_PEERCRED still reports the
+    // supervisor's pid — documented in the README.
+    // SAFETY: socket(2) with a family/type read from the pinned fd;
+    // the domain is one of the allowlisted families checked above.
+    let so_protocol = get_sockopt_int(dup, libc::SO_PROTOCOL).ok();
+    let private = unsafe {
+        libc::socket(
+            domain,
+            so_type | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            so_protocol.unwrap_or(0),
+        )
+    };
+    if private < 0 {
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EACCES);
+        // SAFETY: dup is a valid fd from pidfd_getfd.
+        unsafe { libc::close(dup) };
+        audit_unix_blocked(audit_fd, dropped, pid, "", "socket-failed");
+        return respond_errno(listener_fd, notif, errno);
+    }
+
+    let close_both = |private: RawFd| {
+        // SAFETY: both fds are valid and owned by this closure call.
+        unsafe {
+            libc::close(dup);
+            libc::close(private);
+        }
+    };
+
+    if domain == libc::AF_UNIX {
+        // Validate the sockaddr structurally (the snapshot's family
+        // field is NOT consulted — the kernel does not reliably
+        // check it for AF_UNIX either; the fd's domain decides).
+        if snapshot.len() < 3 {
+            close_both(private);
+            return respond_errno(listener_fd, notif, libc::EINVAL);
+        }
+        let mut unix_addr = parse_unix_path_bytes(&snapshot[2..]);
+        if matches!(unix_addr, UnixSockaddr::Unterminated) {
+            // glibc's SUN_LEN(), socat and ncat all pass
+            // addrlen = 2 + strlen(path) with no trailing NUL; the
+            // kernel's unix_mkname_bsd appends it and the connect
+            // succeeds. Rejecting what the kernel accepts fails
+            // those clients under the policy, so rebuild the address
+            // with the terminator added. The peer check below is the
+            // security control, not the request bytes.
+            if snapshot.len() > 1 + std::mem::size_of::<libc::sockaddr_un>() {
+                close_both(private);
+                return respond_errno(listener_fd, notif, libc::ENAMETOOLONG);
+            }
+            // Parse from a terminated COPY, but dial with the
+            // ORIGINAL snapshot: a 108-character path with no NUL is
+            // exactly addrlen 110, which the kernel accepts — adding
+            // the terminator would make the dial's sockaddr 111
+            // bytes and fail with EINVAL. The terminator is for
+            // parsing, not for connect().
+            let mut terminated = snapshot.clone();
+            terminated.push(0);
+            // Re-parse: an unterminated RELATIVE path (socat or ncat
+            // after a chdir) must reach the /proc/<tgid>/cwd rewrite
+            // below as a Path, not stay Unterminated and be resolved
+            // against the supervisor's working directory.
+            unix_addr = parse_unix_path_bytes(&terminated[2..]);
+        }
+
+        // The kernel resolves a relative sun_path against the
+        // CALLER's working directory — here that would be the
+        // supervisor's, which never chdir'd from the launch
+        // directory. A target that chdir'd and connects relatively
+        // (the standard workaround for the 108-byte limit) would
+        // reach the wrong socket or ENOENT. Rewrite the path against
+        // the caller's /proc/<tgid>/cwd before dialing. The peer
+        // check still applies to whatever the private socket
+        // actually connects to, so this fixes reachability, not
+        // policy.
+        if let UnixSockaddr::Path(path) = &unix_addr {
+            if !path.starts_with('/') {
+                let rewritten = format!("/proc/{tgid}/cwd/{path}");
+                if rewritten.len() + 3 > std::mem::size_of::<libc::sockaddr_un>() {
+                    close_both(private);
+                    return respond_errno(listener_fd, notif, libc::ENAMETOOLONG);
+                }
+                let mut addr_un: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+                addr_un.sun_family = libc::AF_UNIX as libc::sa_family_t;
+                // SAFETY: rewritten is shorter than sun_path by the
+                // length check above; copy then NUL is already zeroed.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        rewritten.as_ptr(),
+                        addr_un.sun_path.as_mut_ptr().cast(),
+                        rewritten.len(),
+                    );
+                }
+                let full = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+                // SAFETY: connect with the rebuilt sockaddr.
+                let ret = unsafe {
+                    libc::connect(
+                        private,
+                        &addr_un as *const libc::sockaddr_un as *const libc::sockaddr,
+                        full,
+                    )
+                };
+                if ret != 0 {
+                    let errno = std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EACCES);
+                    close_both(private);
+                    return respond_errno(listener_fd, notif, errno);
+                }
+                // Peer verification + delivery, same as the absolute
+                // path below. `dup` (the pidfd_getfd copy) is closed
+                // here: verify_and_deliver owns only `private`, and
+                // leaking one descriptor per brokered connect drives
+                // the supervisor into EMFILE mid-run.
+                // SAFETY: dup is a valid fd owned by this call path.
+                unsafe { libc::close(dup) };
+                return verify_and_deliver(
+                    listener_fd,
+                    notif,
+                    private,
+                    audit_fd,
+                    config,
+                    dropped,
+                    pid,
+                    orig_status_flags,
+                    orig_fd_flags,
+                    sockfd as libc::c_int,
+                );
+            }
+        }
+
+        // Dial. AF_UNIX connects complete or fail immediately
+        // (EAGAIN on a full backlog); there is no EINPROGRESS for
+        // UDS.
+        if let Err(e) = connect_snapshot(private, &snapshot) {
+            let errno = e.raw_os_error().unwrap_or(libc::EACCES);
+            close_both(private);
+            // Dial failures are target-visible (ENOENT, ECONNREFUSED,
+            // EAGAIN, EPROTOTYPE, EAFNOSUPPORT, ...) — pass through.
+            return respond_errno(listener_fd, notif, errno);
+        }
+
+        // SAFETY: dup is a valid fd owned by this call path; closed
+        // here for the same EMFILE reason as the relative branch.
+        unsafe { libc::close(dup) };
+        return verify_and_deliver(
+            listener_fd,
+            notif,
+            private,
+            audit_fd,
+            config,
+            dropped,
+            pid,
+            orig_status_flags,
+            orig_fd_flags,
+            sockfd as libc::c_int,
+        );
+    }
+
+    // INET families: apply the existing bridge/enforce policy to the
+    // snapshot BEFORE dialing — the supervisor only dials allowed
+    // targets.
+    if domain == libc::AF_INET || domain == libc::AF_INET6 {
+        match snapshot_inet_info(&snapshot, domain) {
+            Some(info) => {
+                if !is_bridge_addr(&info, config) {
+                    if config.audit_network {
+                        write_audit_line(
+                            audit_fd,
+                            dropped,
+                            &format!(
+                                "{{\"type\":\"network_blocked\",\"pid\":{pid},\"dest\":\"{}\",\"syscall\":\"connect\"}}",
+                                escape_for_audit(&info.destination),
+                            ),
+                        );
+                    }
+                    if config.enforce_network {
+                        close_both(private);
+                        return respond_errno(listener_fd, notif, libc::ECONNREFUSED);
+                    }
+                }
+            }
+            None => {
+                // Malformed INET sockaddr.
+                close_both(private);
+                return respond_errno(listener_fd, notif, libc::EINVAL);
+            }
+        }
+    }
+
+    // Dial (INET may return EINPROGRESS; other families pass
+    // through with whatever the kernel says).
+    match connect_snapshot(private, &snapshot) {
+        Ok(()) => {
+            // SAFETY: dup is a valid fd; private ownership transfers.
+            unsafe { libc::close(dup) };
+            match install_delivered_fd(
+                listener_fd,
+                notif,
+                private,
+                orig_status_flags,
+                orig_fd_flags,
+                sockfd as u32,
+            ) {
+                DeliverOutcome::Delivered => respond_val(listener_fd, notif, 0),
+                DeliverOutcome::Stale => false,
+                DeliverOutcome::Failed => {
+                    audit_unix_blocked(audit_fd, dropped, pid, "", "addfd-failed");
+                    respond_errno(listener_fd, notif, libc::EACCES)
+                }
+            }
+        }
+        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {
+            if orig_status_flags & libc::O_NONBLOCK != 0 {
+                // Nonblocking socket: POSIX result is EINPROGRESS and
+                // the target polls on the delivered socket.
+                // SAFETY: dup is a valid fd; private ownership transfers.
+                unsafe { libc::close(dup) };
+                return match install_delivered_fd(
+                    listener_fd,
+                    notif,
+                    private,
+                    orig_status_flags,
+                    orig_fd_flags,
+                    sockfd as u32,
+                ) {
+                    DeliverOutcome::Delivered => {
+                        respond_errno(listener_fd, notif, libc::EINPROGRESS)
+                    }
+                    DeliverOutcome::Stale => false,
+                    DeliverOutcome::Failed => {
+                        audit_unix_blocked(audit_fd, dropped, pid, "", "addfd-failed");
+                        respond_errno(listener_fd, notif, libc::EACCES)
+                    }
+                };
+            }
+            // Blocking socket: wait for completion on a helper thread
+            // so the supervisor loop never stalls.
+            // SAFETY: dup is a valid fd; private ownership transfers
+            // to the helper.
+            unsafe { libc::close(dup) };
+            if active_connect_helpers().load(Ordering::Relaxed) >= MAX_CONNECT_HELPERS {
+                // SAFETY: private is a valid fd.
+                unsafe { libc::close(private) };
+                audit_unix_blocked(audit_fd, dropped, pid, "", "helper-cap");
+                return respond_errno(listener_fd, notif, libc::EAGAIN);
+            }
+            let helper = ConnectHelper {
+                listener_fd,
+                audit_fd,
+                dropped: std::sync::Arc::clone(dropped),
+                notif: *notif,
+                private,
+                orig_status_flags,
+                orig_fd_flags,
+                target_fd: sockfd as u32,
+            };
+            active_connect_helpers().fetch_add(1, Ordering::Relaxed);
+            match std::thread::Builder::new()
+                .name("connect-helper".into())
+                .spawn(move || {
+                    helper.run();
+                    active_connect_helpers().fetch_sub(1, Ordering::Relaxed);
+                }) {
+                // The helper owns the response.
+                Ok(_handle) => true,
+                Err(_) => {
+                    active_connect_helpers().fetch_sub(1, Ordering::Relaxed);
+                    // SAFETY: private is a valid fd.
+                    unsafe { libc::close(private) };
+                    audit_unix_blocked(audit_fd, dropped, pid, "", "helper-spawn-failed");
+                    respond_errno(listener_fd, notif, libc::EACCES)
+                }
+            }
+        }
+        Err(e) => {
+            let errno = e.raw_os_error().unwrap_or(libc::EACCES);
+            close_both(private);
+            respond_errno(listener_fd, notif, errno)
+        }
     }
 }
 
@@ -884,14 +1843,31 @@ fn escape_for_audit(s: &str) -> String {
 ///
 /// The audit pipe is O_NONBLOCK. On EAGAIN, increments the drop counter
 /// and skips the write. When the pipe becomes writable again and there
-/// were drops, flushes a summary line.
-fn write_audit_line(audit_fd: RawFd, dropped: &mut u64, line: &str) {
-    // Flush drop summary if there were previous drops.
-    if *dropped > 0 {
-        let summary = format!("{{\"type\":\"dropped\",\"count\":{}}}\n", *dropped);
+/// were drops, flushes a summary line. The counter is atomic: helper
+/// threads emit audit lines concurrently with the supervisor loop.
+fn write_audit_line(
+    audit_fd: RawFd,
+    dropped: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    line: &str,
+) {
+    use std::sync::atomic::Ordering;
+    // Policy-only runs have no audit pipe (fd -1): events are
+    // discarded rather than written to a bad fd.
+    if audit_fd < 0 {
+        return;
+    }
+    // Flush drop summary if there were previous drops. swap(0) takes
+    // the count and resets it in one step: load-then-store loses any
+    // drop counted between the two, which is exactly the traffic this
+    // summary exists to account for.
+    let pending = dropped.swap(0, Ordering::Relaxed);
+    if pending > 0 {
+        let summary = format!("{{\"type\":\"dropped\",\"count\":{pending}}}\n");
         let ret = unsafe { libc::write(audit_fd, summary.as_ptr().cast(), summary.len()) };
-        if ret > 0 {
-            *dropped = 0;
+        if ret <= 0 {
+            // The write failed; keep the count for the next flush
+            // instead of losing the drops silently.
+            dropped.fetch_add(pending, Ordering::Relaxed);
         }
     }
 
@@ -903,7 +1879,7 @@ fn write_audit_line(audit_fd: RawFd, dropped: &mut u64, line: &str) {
             "audit line exceeds PIPE_BUF ({} bytes), dropping",
             line.len()
         );
-        *dropped += 1;
+        dropped.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -912,7 +1888,7 @@ fn write_audit_line(audit_fd: RawFd, dropped: &mut u64, line: &str) {
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         if err.kind() == std::io::ErrorKind::WouldBlock {
-            *dropped += 1;
+            dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -925,12 +1901,14 @@ fn write_audit_line(audit_fd: RawFd, dropped: &mut u64, line: &str) {
 /// `handle_notification()`, and exits when the listener FD becomes
 /// invalid (target process exited, filter destroyed → ENOENT).
 pub fn supervisor_loop(listener_fd: RawFd, audit_fd: RawFd, config: &UnotifyConfig) -> ! {
-    let mut dropped: u64 = 0;
+    use std::sync::atomic::Ordering;
+    let dropped: std::sync::Arc<std::sync::atomic::AtomicU64> =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     loop {
         match notif_recv(listener_fd) {
             Ok(notif) => {
-                handle_notification(listener_fd, &notif, audit_fd, config, &mut dropped);
+                handle_notification(listener_fd, &notif, audit_fd, config, &dropped);
             }
             Err(e) => {
                 let errno = e.raw_os_error().unwrap_or(0);
@@ -948,6 +1926,7 @@ pub fn supervisor_loop(listener_fd: RawFd, audit_fd: RawFd, config: &UnotifyConf
     }
 
     // Flush final drop count.
+    let dropped = dropped.load(Ordering::Relaxed);
     if dropped > 0 {
         let summary = format!("{{\"type\":\"dropped\",\"count\":{dropped}}}\n");
         let _ = unsafe { libc::write(audit_fd, summary.as_ptr().cast(), summary.len()) };
@@ -1075,12 +2054,57 @@ pub struct UnotifyConfig {
     /// Should only be true when `use_netns` is active (netns is the
     /// primary security boundary; unotify blocking is defense-in-depth).
     pub enforce_network: bool,
+    /// Broker connect() and deny privileged Unix sockets (the UDS
+    /// connect policy). While active, connect() notifications are
+    /// NEVER answered with CONTINUE: the supervisor dials a
+    /// supervisor-private socket with a snapshot of the target's
+    /// sockaddr, verifies the peer, and — when allowed — installs the
+    /// verified socket into the target's fd table via
+    /// `SECCOMP_IOCTL_NOTIF_ADDFD` (SETFD). The target's original
+    /// socket is never connected, in any branch.
+    pub enforce_unix_connect: bool,
+    /// Deny roots for the UDS connect policy: the connection is
+    /// denied when the peer's bound path (as reported by
+    /// `getpeername`, i.e. the listener's bind()-time literal) equals
+    /// a root or lies beneath it. Built-in roots plus operator
+    /// additions, normalized by the launcher.
+    pub unix_deny_roots: Vec<String>,
 }
 
 impl UnotifyConfig {
     pub fn any_enabled(&self) -> bool {
-        self.audit_file_access || self.audit_network
+        self.audit_file_access || self.audit_network || self.enforce_unix_connect
     }
+}
+
+/// Built-in deny roots for the UDS connect policy.
+///
+/// Matched against the peer's bind()-time literal path
+/// (component-wise, after `/var/run/` → `/run/` alias
+/// normalization). `/run/user/<uid>/...` is deliberately absent:
+/// rootless daemon sockets (e.g. rootless podman) live there and
+/// must keep working. Unknown paths outside the roots remain
+/// reachable by design — the list is the allow-by-default tradeoff
+/// that keeps legitimate socket use working; operators extend it via
+/// `unix_socket_deny_roots`.
+pub fn builtin_unix_deny_roots() -> Vec<String> {
+    [
+        "/run/docker.sock",
+        "/run/snap.docker.dockerd.sock",
+        "/run/podman",
+        "/run/containerd",
+        "/run/crio",
+        "/run/dbus",
+        "/run/libvirt",
+        "/run/systemd/private",
+        "/run/lxd",
+        "/var/lib/lxd/unix.socket",
+        "/run/snapd.socket",
+        "/run/snapd-snap.socket",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 /// FDs returned by `fork_unotify_supervisor` for the caller to use.
@@ -1161,6 +2185,8 @@ pub fn fork_unotify_supervisor(
         bridge_port: config.bridge_port,
         dns_port: config.dns_port,
         enforce_network: config.enforce_network,
+        enforce_unix_connect: config.enforce_unix_connect,
+        unix_deny_roots: config.unix_deny_roots.clone(),
     };
 
     // SAFETY: single-threaded at this point (between bridge fork and
@@ -1306,8 +2332,9 @@ fn apply_supervisor_seccomp(debug: bool) -> crate::Result<()> {
     let arch = crate::seccomp::target_arch()?;
     let mut allow: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
 
-    // I/O: /proc/<pid>/mem reading, audit pipe writing, socketpair recv,
-    // pidfd_open+pidfd_getfd for listener FD transfer.
+    // I/O: /proc/<pid>/mem and /proc/<pid>/status reading, audit
+    // pipe writing, socketpair recv, pidfd_open+pidfd_getfd for
+    // listener FD transfer.
     for nr in [
         libc::SYS_openat,
         libc::SYS_read,
@@ -1318,16 +2345,65 @@ fn apply_supervisor_seccomp(debug: bool) -> crate::Result<()> {
         libc::SYS_lseek,
         libc::SYS_ppoll,
         libc::SYS_fcntl,
+        libc::SYS_statx,
         libc::SYS_pidfd_open,
         libc::SYS_pidfd_getfd,
     ] {
         allow.insert(nr, vec![]);
     }
 
+    // connect() broker (UDS connect policy): dial verified private
+    // sockets, read the pinned fd's identity, and read the peer's
+    // bound address.
+    for nr in [
+        libc::SYS_connect,
+        libc::SYS_getsockopt,
+        libc::SYS_getpeername,
+    ] {
+        allow.insert(nr, vec![]);
+    }
+
+    // socket: only the families the broker dials (AF_UNIX for the
+    // policy itself, INET for emulated connects).
+    let socket_rules = [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6]
+        .into_iter()
+        .map(|family| {
+            SeccompRule::new(vec![
+                SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, family as u64)
+                    .map_err(|e| Error::Seccomp(format!("socket condition: {e}")))?,
+            ])
+            .map_err(|e| Error::Seccomp(format!("socket rule: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    allow.insert(libc::SYS_socket, socket_rules);
+
+    // clone: thread-creation flags only (helper threads completing
+    // blocking emulated connects), namespace flags denied — same
+    // rule shape as the bridge child.
+    let clone_rule = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(crate::bridge::CLONE_THREAD_FLAGS),
+            crate::bridge::CLONE_THREAD_FLAGS,
+        )
+        .map_err(|e| Error::Seccomp(format!("clone condition: {e}")))?,
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(crate::bridge::CLONE_NS_FLAGS),
+            0,
+        )
+        .map_err(|e| Error::Seccomp(format!("clone ns deny condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("clone rule: {e}")))?;
+    allow.insert(libc::SYS_clone, vec![clone_rule]);
+
     // ioctl: restrict to seccomp notification commands only.
-    let allowed_ioctls: [u64; 4] = [
+    let allowed_ioctls: [u64; 5] = [
         SECCOMP_IOCTL_NOTIF_RECV as _,
         SECCOMP_IOCTL_NOTIF_SEND as _,
+        SECCOMP_IOCTL_NOTIF_ADDFD as _,
         SECCOMP_IOCTL_NOTIF_ID_VALID_NEW as _,
         SECCOMP_IOCTL_NOTIF_ID_VALID_OLD as _,
     ];
@@ -1658,6 +2734,8 @@ mod tests {
                 bridge_port: None,
                 dns_port: None,
                 enforce_network: false,
+                enforce_unix_connect: false,
+                unix_deny_roots: Vec::new(),
             }
             .any_enabled()
         );
@@ -1668,6 +2746,8 @@ mod tests {
                 bridge_port: None,
                 dns_port: None,
                 enforce_network: false,
+                enforce_unix_connect: false,
+                unix_deny_roots: Vec::new(),
             }
             .any_enabled()
         );
@@ -1678,6 +2758,20 @@ mod tests {
                 bridge_port: Some(8080),
                 dns_port: None,
                 enforce_network: true,
+                enforce_unix_connect: false,
+                unix_deny_roots: Vec::new(),
+            }
+            .any_enabled()
+        );
+        assert!(
+            UnotifyConfig {
+                audit_file_access: false,
+                audit_network: false,
+                bridge_port: None,
+                dns_port: None,
+                enforce_network: false,
+                enforce_unix_connect: true,
+                unix_deny_roots: builtin_unix_deny_roots(),
             }
             .any_enabled()
         );
@@ -1688,6 +2782,208 @@ mod tests {
         // Just verify the probe doesn't panic or hang.
         // The actual result depends on kernel version.
         let _ = unotify_available();
+    }
+
+    // ─── UDS connect policy: deny-root matching ──────────────────
+
+    fn roots(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn deny_root_matches_exact_file() {
+        let r = roots(&["/run/docker.sock"]);
+        assert!(peer_denied("/run/docker.sock", &r));
+        assert!(!peer_denied("/run/docker.sockx", &r));
+    }
+
+    #[test]
+    fn deny_root_matches_beneath_directory() {
+        let r = roots(&["/run/podman"]);
+        assert!(peer_denied("/run/podman/podman.sock", &r));
+        assert!(peer_denied("/run/podman", &r));
+        assert!(
+            !peer_denied("/run/podmanx/y.sock", &r),
+            "component-wise only"
+        );
+    }
+
+    #[test]
+    fn deny_root_var_run_alias_normalized_both_directions() {
+        // getpeername returns the listener's bind()-time literal, so
+        // a daemon bound via the /var/run spelling reports it.
+        let r = roots(&["/run/docker.sock"]);
+        assert!(peer_denied("/var/run/docker.sock", &r));
+        let r2 = roots(&["/var/run/libvirt"]);
+        assert!(peer_denied("/run/libvirt/libvirt-sock", &r2));
+        assert!(peer_denied("/var/run/libvirt/libvirt-sock", &r2));
+    }
+
+    #[test]
+    fn deny_root_snap_docker_spelling() {
+        let r = roots(&["/run/snap.docker.dockerd.sock"]);
+        assert!(peer_denied("/run/snap.docker.dockerd.sock", &r));
+        assert!(peer_denied("/var/run/snap.docker.dockerd.sock", &r));
+    }
+
+    #[test]
+    fn deny_root_never_matches_user_runtime_dir() {
+        // Rootless podman and friends live under /run/user/<uid>/.
+        let r = roots(&["/run/podman", "/run/docker.sock"]);
+        assert!(!peer_denied("/run/user/1000/podman/podman.sock", &r));
+        assert!(!peer_denied("/var/run/user/1000/podman/podman.sock", &r));
+    }
+
+    #[test]
+    fn deny_root_trailing_slash_tolerated() {
+        let r = roots(&["/run/libvirt/"]);
+        assert!(peer_denied("/run/libvirt/libvirt-sock", &r));
+    }
+
+    #[test]
+    fn deny_root_dotdot_in_peer_literal_matched_literally() {
+        // Only the daemon's bind string matters; a literal ".." in it
+        // is matched as-is, not resolved.
+        let r = roots(&["/run/x"]);
+        assert!(!peer_denied("/run/../run/docker.sock", &r));
+    }
+
+    #[test]
+    fn builtin_roots_cover_escape_daemons() {
+        let r = builtin_unix_deny_roots();
+        for peer in [
+            "/run/docker.sock",
+            "/var/run/docker.sock",
+            "/run/snap.docker.dockerd.sock",
+            "/run/podman/podman.sock",
+            "/var/run/podman/podman.sock",
+            "/run/containerd/containerd.sock",
+            "/run/crio/crio.sock",
+            "/run/dbus/system_bus_socket",
+            "/var/run/dbus/system_bus_socket",
+            "/run/libvirt/libvirt-sock",
+            "/var/run/libvirt/libvirt-sock",
+            "/run/systemd/private",
+            "/run/lxd/unix.socket",
+            "/var/lib/lxd/unix.socket",
+            "/run/snapd.socket",
+            "/run/snapd-snap.socket",
+        ] {
+            assert!(peer_denied(peer, &r), "builtin roots must deny {peer}");
+        }
+        // And must NOT deny the sanctioned rootless paths.
+        assert!(!peer_denied("/run/user/1000/podman/podman.sock", &r));
+    }
+
+    // ─── UDS connect policy: BPF arch kill ───────────────────────
+
+    #[test]
+    fn bpf_kill_arch_appends_kill_return() {
+        let bpf = build_unotify_bpf_kill_arch(&[libc::SYS_connect]).unwrap();
+        // load arch + arch jump + load nr + pair(2) + ALLOW + KILL = 7
+        assert_eq!(bpf.len(), 7);
+        let last = bpf.last().unwrap();
+        assert_eq!(last.code, BPF_RET | BPF_K);
+        assert_eq!(last.k, libc::SECCOMP_RET_KILL_PROCESS);
+        // The default (matching-arch, unmatched syscall) is still ALLOW.
+        assert_eq!(bpf[bpf.len() - 2].k, 0x7fff_0000);
+    }
+
+    #[test]
+    fn bpf_kill_arch_jump_skips_to_kill_instruction() {
+        // With two syscalls the program is:
+        // [load arch, jump, load nr, j1, notif, j2, notif, ALLOW, KILL]
+        // The arch jump's false-branch must land on the KILL (last).
+        let bpf = build_unotify_bpf_kill_arch(&[1, 2]).unwrap();
+        let arch_jump = &bpf[1];
+        let jf = arch_jump.jf as usize;
+        // BPF jump offsets are relative to the next instruction
+        // (index 2); the KILL is the last instruction.
+        let target = 2 + jf;
+        assert_eq!(target, bpf.len() - 1);
+        assert_eq!(bpf[target].k, libc::SECCOMP_RET_KILL_PROCESS);
+    }
+
+    #[test]
+    fn bpf_kill_arch_still_notifies_target_syscalls() {
+        let bpf = build_unotify_bpf_kill_arch(&[libc::SYS_connect]).unwrap();
+        assert!(
+            bpf.iter()
+                .any(|i| i.code == BPF_RET | BPF_K && i.k == libc::SECCOMP_RET_USER_NOTIF),
+            "kill-arch BPF should still contain SECCOMP_RET_USER_NOTIF"
+        );
+    }
+
+    #[test]
+    fn supervisor_seccomp_allows_broker_syscalls() {
+        // Extends the write(2) smoke test to the connect-broker
+        // surface: a filtered child must be able to create a socket
+        // of an allowed family, getsockopt/getpeername it, and fcntl
+        // it without being killed. clone-thread creation is covered
+        // by an std::thread spawn inside the filtered child.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64);
+            }
+            #[cfg(seccomp_supported)]
+            if apply_supervisor_seccomp(false).is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            // Socket of an allowed family.
+            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                unsafe { libc::_exit(3) };
+            }
+            // fd identity reads.
+            if get_sockopt_int(fd, libc::SO_DOMAIN).unwrap_or(-1) != libc::AF_UNIX {
+                unsafe { libc::_exit(4) };
+            }
+            if get_sockopt_int(fd, libc::SO_TYPE).unwrap_or(-1) != libc::SOCK_STREAM {
+                unsafe { libc::_exit(5) };
+            }
+            // getpeername on an unconnected socket fails (ENOTCONN)
+            // but must not kill the process.
+            let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            let mut len: libc::socklen_t =
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            unsafe {
+                libc::getpeername(fd, &mut sa as *mut _ as *mut libc::sockaddr, &mut len);
+            }
+            // fcntl.
+            if unsafe { libc::fcntl(fd, libc::F_GETFL) } < 0 {
+                unsafe { libc::_exit(6) };
+            }
+            unsafe { libc::close(fd) };
+            // Helper-thread creation (clone with thread flags).
+            let ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = std::sync::Arc::clone(&ok);
+            let handle = std::thread::Builder::new()
+                .name("smoke".into())
+                .spawn(move || {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+            if handle.is_err() {
+                unsafe { libc::_exit(7) };
+            }
+            handle
+                .expect("checked above")
+                .join()
+                .expect("helper must join");
+            if !ok.load(std::sync::atomic::Ordering::Relaxed) {
+                unsafe { libc::_exit(8) };
+            }
+            unsafe { libc::_exit(0) };
+        }
+        let mut status: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(ret > 0, "waitpid failed");
+        assert!(
+            libc::WIFEXITED(status),
+            "child should exit normally, not be killed by seccomp"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
     #[test]
