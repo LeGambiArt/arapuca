@@ -690,6 +690,12 @@ fn uds_policy_selfexec_path_brokers_connects() {
         eprintln!("skipping: requires python3");
         return;
     }
+    if !netns_root_available() {
+        // The trampoline unshares a user+net namespace in its own
+        // fork child; containers without CAP_SYS_ADMIN deny that.
+        eprintln!("skipping: requires unshare userns (container without CAP_SYS_ADMIN)");
+        return;
+    }
     if yama_scope_is_absolute() {
         eprintln!("skipping: yama ptrace_scope=3 denies all ptrace (reboot to restore)");
         return;
@@ -1200,6 +1206,10 @@ fn delivered_socket_survives_target_execve() {
         eprintln!("skipping: requires python3");
         return;
     }
+    if !netns_root_available() {
+        eprintln!("skipping: requires unshare userns (container without CAP_SYS_ADMIN)");
+        return;
+    }
     // Inline gate: the yama_scope_is_absolute helper arrives with a
     // later commit; scope 3 denies the supervisor inspection outright.
     let yama_abs = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
@@ -1584,6 +1594,10 @@ fn uds_policy_survives_signal_interrupted_connects() {
     // fails it).
     if !python3_available() {
         eprintln!("skipping: requires python3");
+        return;
+    }
+    if !netns_root_available() {
+        eprintln!("skipping: requires unshare userns (container without CAP_SYS_ADMIN)");
         return;
     }
     if yama_scope_is_absolute() {
