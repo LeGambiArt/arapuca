@@ -2119,19 +2119,46 @@ pub fn supervisor_loop(
             }
             // Not a confirmed exit — keep serving the listener.
         }
-        if fds[0].revents != 0 {
+        // The filter is orphaned (every task carrying it exited) when
+        // the listener hangs up with nothing left to read — and this
+        // must be decided BEFORE calling recv: on kernels before 6.6
+        // NOTIF_RECV blocks in down_interruptible even when the filter
+        // has no users left, so a recv entered on a POLLHUP-only
+        // listener never returns (pidns mode hits this: the relay
+        // reaps the pid-1 target, the listener hangs up, the relay's
+        // pidfd has not fired yet). POLLHUP arrives together with a
+        // trailing POLLIN notification in the normal single-target
+        // case, so only the no-POLLIN form ends the loop.
+        if fds[0].revents & libc::POLLIN == 0
+            && fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0
+        {
+            break;
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
             match notif_recv(listener_fd) {
                 Ok(notif) => {
                     handle_notification(listener_fd, &notif, audit_fd, config, &dropped);
                 }
                 Err(e) => {
                     let errno = e.raw_os_error().unwrap_or(0);
-                    if errno == libc::EINTR {
+                    // EINTR and ENOENT both mean "no notification this
+                    // time, keep going": ENOENT is returned not only
+                    // when the filter is destroyed but when the
+                    // target's blocked syscall was interrupted by a
+                    // signal handler — the notification is withdrawn
+                    // while the target lives (seccomp_user_notif(2);
+                    // observed 1-2 per ~5000 notifications under a
+                    // signal storm on 6.18). Treating that as
+                    // "filter destroyed" ends the loop while the
+                    // wrapper still runs, and every later intercepted
+                    // syscall then blocks forever on a listener nobody
+                    // reads.
+                    if errno == libc::EINTR || errno == libc::ENOENT {
+                        // A withdrawn notification: retry the recv.
                         continue;
                     }
-                    // ENOENT: filter destroyed (target exited). Normal exit.
-                    // EBADF: listener FD closed. Also normal.
-                    if errno != libc::ENOENT && errno != libc::EBADF {
+                    // EBADF: listener FD closed. Normal exit.
+                    if errno != libc::EBADF {
                         log::warn!("unotify supervisor: recv error: {e}");
                         exit = LoopExit::Error;
                     }
@@ -3145,6 +3172,15 @@ pub fn run_supervisor_mode(args: &[String]) -> ! {
             libc::syscall(libc::SYS_tgkill, child_pid, child_pid, libc::SIGKILL);
         }
     }
+
+    // Close the listener BEFORE the blocking wait: a notification
+    // that arrives between the loop's exit and the wrapper's death
+    // would otherwise block the target forever on a listener nobody
+    // reads. With the fd closed, the kernel fails those intercepted
+    // syscalls with ENOSYS — loudly, not silently wedged.
+    // SAFETY: listener_fd is a valid descriptor or already closed
+    // (close is idempotent enough here: EBADF is harmless).
+    unsafe { libc::close(listener_fd) };
 
     // Reap and exit with the wrapper's status (exit code re-raised,
     // signal deaths re-raised — full fidelity, no status pipe).
