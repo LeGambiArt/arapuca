@@ -404,11 +404,25 @@ fn main() {
                     }
                 };
                 let proxy = format!("http://127.0.0.1:{bridge_port}");
+                // Loopback must stay direct: the bridge is the only
+                // listener on the namespace's loopback, so proxying a
+                // loopback destination through it loops back into the
+                // bridge. Env-honoring clients that CONNECT-tunnel
+                // http origins (undici's EnvHttpProxyAgent with
+                // proxyTunnel) would otherwise wrap their
+                // bridge-directed traffic in a CONNECT the far end
+                // of the relay cannot answer.
+                // Loopback hosts always excluded from the proxy vars:
+                // the bridge is the namespace's only loopback listener,
+                // so a loopback destination routed through it is a loop.
+                const LOOPBACK_NO_PROXY: &str = "127.0.0.1,localhost,::1";
                 unsafe {
                     std::env::set_var("HTTP_PROXY", &proxy);
                     std::env::set_var("HTTPS_PROXY", &proxy);
                     std::env::set_var("http_proxy", &proxy);
                     std::env::set_var("https_proxy", &proxy);
+                    std::env::set_var("NO_PROXY", LOOPBACK_NO_PROXY);
+                    std::env::set_var("no_proxy", LOOPBACK_NO_PROXY);
                 }
                 audit_layer(audit_fd, "ProxyBridge", true, None);
             }
