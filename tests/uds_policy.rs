@@ -42,6 +42,7 @@ fn python3_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+#[cfg(target_os = "linux")]
 fn yama_scope() -> u32 {
     std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
         .ok()
