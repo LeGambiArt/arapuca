@@ -942,12 +942,16 @@ fn swap_race_launch(args: &[&str], required_clean: usize, max_attempts: usize) {
                 return;
             }
         }
-        // A failed launch without decoy markers is unexpected —
-        // surface it rather than silently retrying.
-        assert!(
-            !log.is_empty() || status.success(),
-            "launch failed with no decoy involvement (attempt {attempt}): {out}\nstatus: {status}"
-        );
+        // A failed launch with an EMPTY decoy log is the swapper
+        // overwriting the file while an exec was in flight: the
+        // kernel read a half-written ELF and answered ENOEXEC before
+        // any sandbox code ran — the same race class as the decoy
+        // being pinned for the capability check, so retry it. The
+        // final clean-run count is the backstop: a launch that never
+        // succeeds still fails the test.
+        if log.is_empty() && !status.success() {
+            continue;
+        }
     }
     panic!(
         "only {clean}/{required_clean} clean runs after {max_attempts} attempts \
