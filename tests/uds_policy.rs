@@ -1570,3 +1570,111 @@ fn uds_policy_availability_follows_yama_scope() {
         "error must name the opt-out: {stderr}"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn uds_policy_survives_signal_interrupted_connects() {
+    // ENOENT from SECCOMP_IOCTL_NOTIF_RECV means "notification
+    // withdrawn" (the target's blocked syscall was interrupted by a
+    // signal handler) as often as it means "filter destroyed". A
+    // supervisor that reads it as the latter stops serving while the
+    // target lives, and every later connect() blocks forever on a
+    // listener nobody reads. This test storms the target with signals
+    // while it loops connects under the policy: the run must finish,
+    // not hang (the test harness kills it after the deadline and
+    // fails it).
+    if !python3_available() {
+        eprintln!("skipping: requires python3");
+        return;
+    }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies the supervisor inspection");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("storm.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served2 = std::sync::Arc::clone(&served);
+    let _acceptor = std::thread::spawn(move || {
+        // Every connection is dropped immediately: this test measures
+        // that connects are served, not that data flows.
+        for conn in listener.incoming() {
+            match conn {
+                Ok(c) => {
+                    drop(c);
+                    served2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let script = format!(
+        r#"
+import socket, signal, threading, time, sys, os
+
+def handler(signum, frame):
+    pass
+
+# No SA_RESTART: an interrupted connect is withdrawn from the
+# notification queue, which is what produced the ENOENT.
+signal.signal(signal.SIGUSR1, handler)
+
+def storm():
+    while True:
+        os.kill(os.getpid(), signal.SIGUSR1)
+        time.sleep(0.0005)
+
+threading.Thread(target=storm, daemon=True).start()
+
+path = {path:?}
+# More connects than the usual 1024 soft NOFILE limit: a supervisor
+# that leaks one descriptor per brokered connect hits EMFILE here and
+# the remaining connects fail with EACCES.
+for _ in range(1500):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    rc = s.connect_ex(path)
+    s.close()
+    if rc != 0:
+        print("CONNECT_FAILED", rc)
+        sys.exit(7)
+print("STORM_SURVIVED")
+"#,
+        path = sock_path.display().to_string()
+    );
+    // Bounded: a regression that wedges the supervisor must fail the
+    // test, not hang the suite until the harness kills it.
+    let out = run_with_policy_bounded(&["--seccomp", "baseline"], &script);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("STORM_SURVIVED"),
+        "the supervisor must keep serving across withdrawn notifications: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let n = served.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        n > 0,
+        "the storm must have reached the listener at least once (got {n})"
+    );
+}
+#[cfg(target_os = "linux")]
+fn run_with_policy_bounded(extra_args: &[&str], target: &str) -> std::process::Output {
+    // Same as run_with_policy but (a) under timeout(1): wedged runs
+    // fail with 124 instead of hanging the suite, and (b) with the
+    // descriptor limit pinned to 1024: hosts with a high default
+    // NOFILE would otherwise hide a per-connect supervisor leak until
+    // production.
+    let mut cmd = std::process::Command::new("timeout");
+    cmd.arg("90").arg("bash").arg("-c").arg(format!(
+        "ulimit -n 1024; exec {} run --deny-network --seccomp baseline          --deny-privileged-unix-sockets {} -- /usr/bin/python3 -c {}",
+        arapuca_bin().display(),
+        extra_args.join(" "),
+        shell_quote(target)
+    ));
+    cmd.output().unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
