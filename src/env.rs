@@ -277,20 +277,24 @@ pub fn wrapper_path() -> Option<PathBuf> {
             }
         }
     }
-    // Look next to the current executable, then one level up
-    // (handles cargo test binaries in target/debug/deps/).
+    // Walk up from the current executable: the wrapper sits in
+    // target/debug/, but cargo's test-binary placement differs across
+    // versions (deps/ vs build/<pkg>/<hash>/out/), so the distance
+    // varies. A short bounded walk covers every layout without
+    // escaping the target directory tree.
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join(WRAPPER_BIN);
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        let mut depth = 0;
+        while let Some(d) = dir {
+            let candidate = d.join(WRAPPER_BIN);
             if candidate.is_file() {
                 return Some(candidate);
             }
-            if let Some(parent) = dir.parent() {
-                let candidate = parent.join(WRAPPER_BIN);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
+            depth += 1;
+            if depth > 5 {
+                break;
             }
+            dir = d.parent().map(|p| p.to_path_buf());
         }
     }
     // Fall back to PATH.
