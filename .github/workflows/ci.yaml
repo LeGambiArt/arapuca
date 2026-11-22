@@ -51,7 +51,14 @@ jobs:
 
   integration:
     runs-on: ubuntu-latest
-    container: registry.fedoraproject.org/fedora:latest
+    container:
+      image: registry.fedoraproject.org/fedora:latest
+      # The unotify supervisor duplicates the wrapper's seccomp
+      # listener fd with pidfd_getfd(2), which Docker's default
+      # seccomp profile gates on CAP_SYS_PTRACE. Without the
+      # capability every supervisor-mode test fails with
+      # "pidfd_getfd failed".
+      options: --cap-add SYS_PTRACE
     needs: check-linux
     steps:
       - name: Install deps
