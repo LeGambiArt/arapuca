@@ -52,6 +52,13 @@ pub struct Process {
     /// Without pidns, this is None and pid() returns child.id().
     #[cfg(target_os = "linux")]
     pub(crate) target_pid: Option<u32>,
+    /// Whether the target runs in a PID namespace (namespace
+    /// collapse reaps orphans there; the process-group sweep is
+    /// skipped). With the supervisor topology the pid report exists
+    /// for every supervisor launch, so target_pid alone no longer
+    /// distinguishes pidns runs from plain ones.
+    #[cfg(target_os = "linux")]
+    pub(crate) pidns_active: bool,
     /// Set to true after wait() successfully reaps the child.
     /// Guards signal() against PID-recycling races on the kill()
     /// fallback path.
@@ -206,10 +213,20 @@ impl Process {
         // in pre_exec makes child PID = PGID, so we can kill the
         // entire process group after the child exits to clean up
         // orphaned descendants that may hold pipe FDs open.
+        // In supervisor mode the direct child is the supervisor,
+        // which made the WRAPPER a group leader (setpgid) — the
+        // group to sweep is the wrapper's, reported via the pid
+        // report and stored in target_pid. Keying on the
+        // supervisor's own pid would either be a no-op (the wrapper
+        // left that group) or, after a pid recycle, kill an
+        // unrelated process group.
         #[cfg(target_os = "linux")]
-        let child_pgid: i32 = match &self.child {
-            ChildHandle::Managed(c) => c.id() as i32,
-            ChildHandle::Forked(p) => *p as i32,
+        let child_pgid: i32 = match self.target_pid {
+            Some(p) if p > 1 => p as i32,
+            _ => match &self.child {
+                ChildHandle::Managed(c) => c.id() as i32,
+                ChildHandle::Forked(p) => *p as i32,
+            },
         };
 
         // macOS: wait for child to exit without reaping (WNOWAIT),
@@ -273,7 +290,7 @@ impl Process {
         // preventing EOF on the caller's pipes. In pidns mode,
         // namespace collapse handles this automatically.
         #[cfg(target_os = "linux")]
-        if self.target_pid.is_none() && child_pgid > 1 {
+        if !self.pidns_active && child_pgid > 1 {
             unsafe { libc::kill(-child_pgid, libc::SIGKILL) };
         }
 
@@ -920,12 +937,16 @@ impl Drop for Process {
             }
         }
 
-        // Capture the PGID before killing/reaping the child. setsid()
-        // in pre_exec makes child PID = PGID.
+        // Capture the PGID before killing/reaping the child (same
+        // supervisor-mode re-keying as in wait(): the wrapper's
+        // group, not the supervisor's).
         #[cfg(target_os = "linux")]
-        let child_pgid: i32 = match &self.child {
-            ChildHandle::Managed(c) => c.id() as i32,
-            ChildHandle::Forked(p) => *p as i32,
+        let child_pgid: i32 = match self.target_pid {
+            Some(p) if p > 1 => p as i32,
+            _ => match &self.child {
+                ChildHandle::Managed(c) => c.id() as i32,
+                ChildHandle::Forked(p) => *p as i32,
+            },
         };
 
         // Kill the child process first to ensure resources can be
@@ -993,7 +1014,7 @@ impl Drop for Process {
         // Only when wait() hasn't already done this — otherwise the
         // PGID may have been recycled.
         #[cfg(target_os = "linux")]
-        if !self.waited && self.target_pid.is_none() && child_pgid > 1 {
+        if !self.waited && !self.pidns_active && child_pgid > 1 {
             unsafe { libc::kill(-child_pgid, libc::SIGKILL) };
         }
 
@@ -1095,6 +1116,8 @@ mod tests {
                 pidfd: None,
                 #[cfg(target_os = "linux")]
                 target_pid: None,
+                #[cfg(target_os = "linux")]
+                pidns_active: false,
                 waited: false,
                 #[cfg(target_os = "linux")]
                 connect_proxy_pid: None,
@@ -1202,6 +1225,7 @@ mod tests {
             unotify_audit_pipe: None,
             pidfd: None,
             target_pid: None,
+            pidns_active: false,
             waited: false,
             #[cfg(target_os = "macos")]
             launch_timestamp: None,
@@ -1273,6 +1297,8 @@ mod tests {
             pidfd: None,
             #[cfg(target_os = "linux")]
             target_pid: None,
+            #[cfg(target_os = "linux")]
+            pidns_active: false,
             waited: false,
             #[cfg(target_os = "linux")]
             connect_proxy_pid: None,
@@ -1326,6 +1352,8 @@ mod tests {
             pidfd: None,
             #[cfg(target_os = "linux")]
             target_pid: None,
+            #[cfg(target_os = "linux")]
+            pidns_active: false,
             waited: false,
             #[cfg(target_os = "linux")]
             connect_proxy_pid: None,

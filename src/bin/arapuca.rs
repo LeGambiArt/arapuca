@@ -209,12 +209,12 @@ fn main() {
     // 0b. setsid — detach from parent's session. Called BEFORE
     // pdeathsig since setsid clears it. Tolerate EPERM (already a
     // session leader from library's pre_exec).
-    // Supervisor-mode launches SKIP it: the supervisor already made
-    // us a process-group leader (setpgid on both sides of its
-    // fork), so setsid would either fail EPERM or — if we won the
-    // race — escape the supervisor's session, breaking tty signal
-    // routing (Ctrl-C would kill the supervisor → PDEATHSIG SIGKILL
-    // instead of SIGINT to the target) and the orphan sweep.
+    // Supervisor-mode launches SKIP it: the supervisor's fork child
+    // already setsid'd (and took the controlling terminal on tty
+    // runs) before exec'ing us, so this process IS the session
+    // leader — setsid here would fail EPERM, and "succeeding" would
+    // mean dropping the controlling terminal the target's
+    // foreground-group signal routing depends on.
     #[cfg(target_os = "linux")]
     let parent_pid = unsafe { libc::getppid() };
     #[cfg(unix)]
@@ -287,9 +287,8 @@ fn main() {
         }
 
         // ── Unotify supervisor ─────────────────────────────────
-        // Fork BEFORE Landlock, PID namespace, and seccomp.
-        // The supervisor reads /proc/<pid>/mem which Landlock
-        // excludes, and must be in the host PID namespace.
+        // Config first (strict parse — a malformed value never
+        // degrades the policy), then the parent-topology handover.
         #[cfg(seccomp_supported)]
         let unotify_config = match arapuca::env::parse_unotify_config() {
             Ok(config) => config,
@@ -298,67 +297,35 @@ fn main() {
                 std::process::exit(125);
             }
         };
+        // Parent topology: the launcher spawned this wrapper's
+        // supervisor (arapuca --supervisor), which forked us and
+        // passed its socketpair end via ARAPUCA_UNOTIFY_SP_FD. The
+        // supervisor is up by construction — it forked us — so there
+        // is no readiness protocol; the ack after the listener
+        // handover is the synchronization point.
         #[cfg(seccomp_supported)]
-        let unotify_fds = {
-            if let Some(ref config) = unotify_config {
-                // Fail-closed for the UDS connect policy: without a
-                // working supervisor + ADDFD the policy is unenforced.
-                if config.enforce_unix_connect {
-                    if !arapuca::unotify::unotify_available() {
-                        eprintln!(
-                            "arapuca: unix socket connect policy requires seccomp user \
-                             notification support (kernel >= 5.5 and /proc/<pid>/mem \
-                             access; a user namespace via --deny-network or \
-                             --allow-network-listeners, or Yama ptrace_scope=0)"
-                        );
-                        eprintln!(
-                            "arapuca: opt out with --allow-unix-socket-connect (policy \
-                             left unenforced)"
-                        );
-                        std::process::exit(125);
-                    }
-                    if !arapuca::unotify::addfd_available() {
-                        eprintln!(
-                            "arapuca: unix socket connect policy requires \
-                             SECCOMP_IOCTL_NOTIF_ADDFD (kernel >= 5.9)"
-                        );
-                        eprintln!(
-                            "arapuca: opt out with --allow-unix-socket-connect (policy \
-                             left unenforced)"
-                        );
-                        std::process::exit(125);
-                    }
+        let unotify_sp_fd: Option<i32> = {
+            let sp: Option<i32> = std::env::var("ARAPUCA_UNOTIFY_SP_FD")
+                .ok()
+                .and_then(|s| s.parse().ok());
+            match (sp, unotify_config.as_ref()) {
+                (Some(fd), _) => Some(fd),
+                (None, Some(config)) if config.enforce_unix_connect => {
+                    // Fail-closed: the policy is active but the
+                    // launcher did not provide a supervisor.
+                    eprintln!(
+                        "arapuca: unix socket connect policy requires the \\
+                         unotify supervisor (ARAPUCA_UNOTIFY_SP_FD not set)"
+                    );
+                    eprintln!(
+                        "arapuca: opt out with --allow-unix-socket-connect \\
+                         (policy left unenforced)"
+                    );
+                    std::process::exit(125);
                 }
-                // The audit pipe is optional: policy-only runs pass -1
-                // and the supervisor discards events.
-                let unotify_audit_fd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
-                    .ok()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(-1);
-                match arapuca::unotify::fork_unotify_supervisor(
-                    config,
-                    unotify_audit_fd,
-                    seccomp_debug,
-                ) {
-                    Ok(fds) => {
-                        audit_layer(audit_fd, "UnotifySupervisor", true, None);
-                        Some(fds)
-                    }
-                    Err(e) => {
-                        if config.enforce_unix_connect {
-                            eprintln!("arapuca: unotify supervisor: {e}");
-                            eprintln!(
-                                "arapuca: refusing to run without the unix socket \
-                                 connect policy enforced"
-                            );
-                            std::process::exit(125);
-                        }
-                        audit_layer(audit_fd, "UnotifySupervisor", false, Some(&e.to_string()));
-                        None
-                    }
-                }
-            } else {
-                None
+                // Audit-only features tolerate the missing supervisor
+                // (the launcher skips it when unavailable).
+                (None, _) => None,
             }
         };
 
@@ -523,130 +490,100 @@ fn main() {
         // ── Install USER_NOTIF filter LAST + send listener FD ─────
         // Must be after normal seccomp filters so USER_NOTIF is the
         // most recently installed filter (required for CONTINUE flag).
+        // The supervisor (our parent) is up by construction — it
+        // forked us — so the handover starts here with no readiness
+        // poll: write [host_pid, listener_fd], wait for the ack,
+        // exec only after the supervisor holds the listener.
         #[cfg(seccomp_supported)]
-        if let Some(ref fds) = unotify_fds {
+        if let Some(sp_fd) = unotify_sp_fd {
             let policy_active = unotify_config
                 .as_ref()
                 .is_some_and(|c| c.enforce_unix_connect);
-            // Poll readiness first — confirms supervisor is alive.
-            match arapuca::unotify::poll_readiness(fds.readiness_read, 5000) {
-                Ok(()) => {
-                    unsafe { libc::close(fds.readiness_read) };
-
-                    if let Some(ref config) = unotify_config {
-                        let syscalls = arapuca::unotify::target_syscalls(
-                            config.audit_file_access,
-                            config.audit_network,
-                            config.enforce_unix_connect,
-                        );
-                        // The host PID is needed by the supervisor for
-                        // pidfd_open(). In a PID namespace, getpid() returns
-                        // the namespace-local PID (1), so we use the host PID
-                        // piped from fork_into_pidns(). Outside a PID namespace,
-                        // read_host_pid() reads /proc/self/stat — must happen
-                        // BEFORE install_unotify_filter() because the filter
-                        // intercepts openat and would deadlock.
-                        let host_pid =
-                            pidns_host_pid.unwrap_or_else(arapuca::unotify::read_host_pid);
-                        // Under the UDS connect policy, arch-mismatched
-                        // entries (int 0x80 compat) must die instead of
-                        // bypassing the broker.
-                        let build = if config.enforce_unix_connect {
-                            arapuca::unotify::build_unotify_bpf_kill_arch
-                        } else {
-                            arapuca::unotify::build_unotify_bpf
-                        };
-                        match build(&syscalls)
-                            .and_then(|bpf| arapuca::unotify::install_unotify_filter(&bpf))
-                        {
-                            Ok(listener_fd) => {
-                                let mut msg = [0u8; 8];
-                                msg[..4].copy_from_slice(&host_pid.to_ne_bytes());
-                                msg[4..].copy_from_slice(&listener_fd.to_ne_bytes());
-                                if !arapuca::unotify::write_all_raw(fds.socketpair_parent, &msg) {
-                                    eprintln!(
-                                        "arapuca: send unotify fd: {}",
-                                        std::io::Error::last_os_error()
-                                    );
-                                    unsafe { libc::_exit(1) };
-                                }
-                                // Wait for the supervisor to duplicate the
-                                // listener fd BEFORE exec: the fd is CLOEXEC,
-                                // so an exec that wins the race against the
-                                // dup orphans the filter (every intercepted
-                                // syscall would return ENOSYS).
-                                // A supervisor that exited and one that is merely
-                                // slow both mean "no ack", but only the first is
-                                // hopeless; report them apart.
-                                match arapuca::unotify::wait_fd_ack_outcome(
-                                    fds.socketpair_parent,
-                                    5000,
-                                ) {
-                                    arapuca::unotify::AckOutcome::Acked => {}
-                                    outcome => {
-                                        let why = match outcome {
-                                            arapuca::unotify::AckOutcome::SupervisorGone => {
-                                                "exited before taking over the listener fd"
-                                            }
-                                            _ => "did not take over the listener fd within 5s",
-                                        };
-                                        if policy_active {
-                                            eprintln!("arapuca: unotify supervisor {why}");
-                                            eprintln!(
-                                                "arapuca: refusing to run without the unix \
-                                                 socket connect policy enforced"
-                                            );
-                                            unsafe {
-                                                libc::close(fds.socketpair_parent);
-                                                libc::_exit(125);
-                                            }
-                                        }
-                                        eprintln!("arapuca: unotify supervisor {why}");
+            if let Some(ref config) = unotify_config {
+                let syscalls = arapuca::unotify::target_syscalls(
+                    config.audit_file_access,
+                    config.audit_network,
+                    config.enforce_unix_connect,
+                );
+                // The host PID is needed by the supervisor for
+                // pidfd_open(). In a PID namespace, getpid() returns
+                // the namespace-local PID (1), so we use the host PID
+                // piped from fork_into_pidns(). Outside a PID namespace,
+                // read_host_pid() reads /proc/self/stat — must happen
+                // BEFORE install_unotify_filter() because the filter
+                // intercepts openat and would deadlock.
+                let host_pid = pidns_host_pid.unwrap_or_else(arapuca::unotify::read_host_pid);
+                // Under the UDS connect policy, arch-mismatched
+                // entries (int 0x80 compat) must die instead of
+                // bypassing the broker.
+                let build = if config.enforce_unix_connect {
+                    arapuca::unotify::build_unotify_bpf_kill_arch
+                } else {
+                    arapuca::unotify::build_unotify_bpf
+                };
+                match build(&syscalls)
+                    .and_then(|bpf| arapuca::unotify::install_unotify_filter(&bpf))
+                {
+                    Ok(listener_fd) => {
+                        let mut msg = [0u8; 8];
+                        msg[..4].copy_from_slice(&host_pid.to_ne_bytes());
+                        msg[4..].copy_from_slice(&listener_fd.to_ne_bytes());
+                        if !arapuca::unotify::write_all_raw(sp_fd, &msg) {
+                            eprintln!(
+                                "arapuca: send unotify fd: {}",
+                                std::io::Error::last_os_error()
+                            );
+                            unsafe { libc::_exit(1) };
+                        }
+                        // Wait for the supervisor to duplicate the
+                        // listener fd BEFORE exec: the fd is CLOEXEC,
+                        // so an exec that wins the race against the
+                        // dup orphans the filter (every intercepted
+                        // syscall would return ENOSYS).
+                        // A supervisor that exited and one that is merely
+                        // slow both mean "no ack", but only the first is
+                        // hopeless; report them apart.
+                        match arapuca::unotify::wait_fd_ack_outcome(sp_fd, 5000) {
+                            arapuca::unotify::AckOutcome::Acked => {}
+                            outcome => {
+                                let why = match outcome {
+                                    arapuca::unotify::AckOutcome::SupervisorGone => {
+                                        "exited before taking over the listener fd"
                                     }
-                                }
-                                // Keep listener_fd open — supervisor duplicated
-                                // it above. CLOEXEC ensures it closes on exec.
-                                unsafe {
-                                    libc::close(fds.socketpair_parent);
-                                }
-                            }
-                            Err(e) => {
+                                    _ => "did not take over the listener fd within 5s",
+                                };
                                 if policy_active {
-                                    eprintln!("arapuca: unotify filter: {e}");
+                                    eprintln!("arapuca: unotify supervisor {why}");
                                     eprintln!(
                                         "arapuca: refusing to run without the unix \
                                          socket connect policy enforced"
                                     );
                                     unsafe {
-                                        libc::close(fds.socketpair_parent);
+                                        libc::close(sp_fd);
                                         libc::_exit(125);
                                     }
                                 }
-                                eprintln!("arapuca: unotify filter: {e}");
-                                unsafe { libc::close(fds.socketpair_parent) };
+                                eprintln!("arapuca: unotify supervisor {why}");
                             }
                         }
-                    } else {
-                        unsafe { libc::close(fds.socketpair_parent) };
+                        // Keep listener_fd open — supervisor duplicated
+                        // it above. CLOEXEC ensures it closes on exec.
+                        unsafe { libc::close(sp_fd) };
                     }
-                }
-                Err(e) => {
-                    if policy_active {
-                        eprintln!("arapuca: unotify supervisor: {e}");
-                        eprintln!(
-                            "arapuca: refusing to run without the unix socket \
-                             connect policy enforced"
-                        );
-                        unsafe {
-                            libc::close(fds.readiness_read);
-                            libc::close(fds.socketpair_parent);
-                            libc::_exit(125);
+                    Err(e) => {
+                        if policy_active {
+                            eprintln!("arapuca: unotify filter: {e}");
+                            eprintln!(
+                                "arapuca: refusing to run without the unix \
+                                 socket connect policy enforced"
+                            );
+                            unsafe {
+                                libc::close(sp_fd);
+                                libc::_exit(125);
+                            }
                         }
-                    }
-                    eprintln!("arapuca: unotify supervisor: {e}");
-                    unsafe {
-                        libc::close(fds.readiness_read);
-                        libc::close(fds.socketpair_parent);
+                        eprintln!("arapuca: unotify filter: {e}");
+                        unsafe { libc::close(sp_fd) };
                     }
                 }
             }

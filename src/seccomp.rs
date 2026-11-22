@@ -129,7 +129,74 @@ fn build_x32_guard() -> Option<BpfProgram> {
 ///
 /// The caller must ensure no concurrent descriptor-table mutations
 /// (single-threaded context or exclusive ownership).
+/// Whether `fd` is one end of a `socketpair(2)`: a connected
+/// AF_UNIX SOCK_STREAM socket whose peer address is unnamed. Used to
+/// validate the single descriptor the supervisor topology legitimately
+/// hands the wrapper, so a forged env var cannot exempt an arbitrary
+/// inherited socket from the deny-unix-sockets scan.
+fn is_socketpair_end(fd: i32) -> bool {
+    let mut domain: libc::c_int = 0;
+    let mut dlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt with live, correctly sized outputs.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            &mut domain as *mut _ as *mut libc::c_void,
+            &mut dlen,
+        )
+    };
+    if ret != 0 || domain != libc::AF_UNIX {
+        return false;
+    }
+    let mut ty: libc::c_int = 0;
+    let mut tlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: same, for SO_TYPE.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut ty as *mut _ as *mut libc::c_void,
+            &mut tlen,
+        )
+    };
+    if ret != 0 || ty != libc::SOCK_STREAM {
+        return false;
+    }
+    // A socketpair end has an EMPTY peer address: addrlen is exactly
+    // the family field. `sun_path[0] == 0` alone would also match a
+    // peer bound to an abstract name, which a socketpair end never
+    // has.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut alen = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: getpeername with a live, correctly sized sockaddr.
+    let ret =
+        unsafe { libc::getpeername(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut alen) };
+    ret == 0
+        && addr.sun_family == libc::AF_UNIX as libc::sa_family_t
+        && alen as usize == std::mem::size_of::<libc::sa_family_t>()
+}
+
 pub(crate) fn validate_no_retained_unix_resources() -> crate::Result<()> {
+    // The supervisor topology hands the wrapper one AF_UNIX socketpair
+    // end via ARAPUCA_UNOTIFY_SP_FD before this validation runs. It is
+    // ours by construction — but the env var is attacker-visible, so
+    // the exemption requires the descriptor to actually be a
+    // connected, unnamed SOCK_STREAM socket (the shape of a
+    // socketpair(2) end), not an arbitrary inherited AF_UNIX socket.
+    let exempt_fd: Option<i32> = std::env::var("ARAPUCA_UNOTIFY_SP_FD")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(fd) = exempt_fd {
+        if !is_socketpair_end(fd) {
+            return Err(Error::Validation(format!(
+                "deny_unix_sockets: ARAPUCA_UNOTIFY_SP_FD ({fd}) is not a \
+                 socketpair end"
+            )));
+        }
+    }
     let fd_dir = std::fs::read_dir("/proc/self/fd").map_err(|e| {
         Error::Validation(format!(
             "deny_unix_sockets: cannot enumerate /proc/self/fd: {e}"
@@ -178,8 +245,9 @@ pub(crate) fn validate_no_retained_unix_resources() -> crate::Result<()> {
                     "invalid SO_DOMAIN size on fd {fd}"
                 )));
             }
-            // It's a socket — reject AF_UNIX.
-            if domain == libc::AF_UNIX {
+            // It's a socket — reject AF_UNIX, except the
+            // supervisor's socketpair end checked above.
+            if domain == libc::AF_UNIX && Some(fd) != exempt_fd {
                 return Err(Error::Validation(format!(
                     "deny_unix_sockets: inherited AF_UNIX socket on fd {fd}"
                 )));

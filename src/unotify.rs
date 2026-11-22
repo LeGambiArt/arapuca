@@ -2172,18 +2172,6 @@ pub fn unotify_available() -> bool {
     *AVAILABLE.get_or_init(probe_unotify_support)
 }
 
-static AVAILABLE_CHILD_TOPOLOGY: OnceLock<bool> = OnceLock::new();
-
-/// Availability for the legacy child topology (selfexec): there the
-/// supervisor is the target's child and must inspect its PARENT, which
-/// Yama `ptrace_scope >= 1` denies without a user namespace.
-///
-/// Cached on its own: a cached availability answer must never be
-/// shared between probes that ask different questions.
-pub fn unotify_available_child_topology() -> bool {
-    *AVAILABLE_CHILD_TOPOLOGY.get_or_init(|| probe_proc_mem_access() && probe_seccomp_unotify())
-}
-
 static ADDFD_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 /// Check if the kernel supports `SECCOMP_IOCTL_NOTIF_ADDFD`
@@ -2253,9 +2241,11 @@ fn probe_addfd_support() -> bool {
 }
 
 fn probe_unotify_support() -> bool {
-    // Phase 1: Check that we can read a sibling process's /proc/<pid>/mem.
-    // This catches Yama ptrace_scope=1 without a user namespace.
-    if !probe_proc_mem_access() {
+    // Phase 1: Check that the supervisor can read a descendant's
+    // /proc/<pid>/mem — the relationship the parent topology uses.
+    // This catches Yama ptrace_scope=3 (which denies even
+    // parent→child) and Landlock/LSM restrictions.
+    if !probe_proc_mem_access_parent_to_child() {
         log::info!("unotify: /proc/<pid>/mem access blocked (Landlock, Yama, or LSM restriction)");
         return false;
     }
@@ -2264,11 +2254,78 @@ fn probe_unotify_support() -> bool {
     probe_seccomp_unotify()
 }
 
-fn probe_proc_mem_access() -> bool {
-    // The supervisor (a child process) reads a sibling's /proc/<pid>/mem.
-    // Under Yama ptrace_scope=1, parent→child always succeeds but
-    // child→parent (or sibling→sibling) is blocked. We must test the
-    // actual relationship: have a child try to read the parent's mem.
+/// Availability for the legacy child topology (selfexec): the
+/// supervisor is the target's child and must inspect its PARENT —
+/// denied by Yama ptrace_scope >= 1 without a user namespace.
+/// Own cache: the parent- and child-direction probes answer
+/// different questions and must not poison each other's result
+/// (on a Yama-1 host the plain probe caches `true` and would mask
+/// the child-direction denial until run time).
+static AVAILABLE_CHILD_TOPOLOGY: OnceLock<bool> = OnceLock::new();
+
+pub fn unotify_available_child_topology() -> bool {
+    *AVAILABLE_CHILD_TOPOLOGY
+        .get_or_init(|| probe_proc_mem_access_child_to_parent() && probe_seccomp_unotify())
+}
+
+static AVAILABLE_USERNS: OnceLock<bool> = OnceLock::new();
+
+/// Availability for a supervisor that will run INSIDE a user
+/// namespace (netns-wrapped launches): it holds capabilities there,
+/// so parent→child inspection works at Yama scopes 0-2 — only
+/// scope 3 (unconditional deny) blocks it, which the sysctl
+/// reports directly. Used by the launcher for netns runs, where
+/// probing from outside the namespace (the plain-run probe) would
+/// wrongly fail at scope 2.
+pub fn unotify_available_in_userns() -> bool {
+    *AVAILABLE_USERNS.get_or_init(|| yama_scope() < 3 && probe_seccomp_unotify())
+}
+
+/// The host's Yama ptrace_scope (0 when unreadable — permissive).
+fn yama_scope() -> u32 {
+    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn probe_proc_mem_access_parent_to_child() -> bool {
+    // The supervisor (parent) reads its child's /proc/<pid>/mem —
+    // permitted by Yama ptrace_scope 0 and 1 (descendant ptrace),
+    // denied at 2 without caps and at 3 unconditionally.
+    // SAFETY: single-threaded at probe time (called during launch).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return false;
+    }
+    if pid == 0 {
+        // Child: stay alive long enough to be probed.
+        // SAFETY: nanosleep on a zeroed timespec.
+        let ts = libc::timespec {
+            tv_sec: 2,
+            tv_nsec: 0,
+        };
+        unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+        unsafe { libc::_exit(0) };
+    }
+
+    // Parent: try to open the child's /proc/<pid>/mem.
+    let mem_path = format!("/proc/{pid}/mem");
+    let ok = std::fs::File::open(&mem_path).is_ok();
+    // SAFETY: kill + reap the probe child.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        let mut status: libc::c_int = 0;
+        libc::waitpid(pid, &mut status, 0);
+    }
+    ok
+}
+
+fn probe_proc_mem_access_child_to_parent() -> bool {
+    // The legacy child-topology relationship: the supervisor (a
+    // child process) reads the target's (its parent's)
+    // /proc/<pid>/mem. Under Yama ptrace_scope=1 this is blocked
+    // without a user namespace.
     let parent_pid = unsafe { libc::getpid() };
     // SAFETY: single-threaded at probe time (called during sandbox init).
     let pid = unsafe { libc::fork() };
@@ -2798,10 +2855,34 @@ pub fn run_supervisor_mode(args: &[String]) -> ! {
         unsafe { libc::_exit(1) };
     }
 
+    // The pid report: with ARAPUCA_PID_NS the wrapper (and its
+    // relay) owns the report — pass the fd through. Without it, this
+    // supervisor is the writer: report the wrapper pid (its own
+    // process-group leader), close, and strip from the child env.
+    let pidns_mode = std::env::var("ARAPUCA_PID_NS").as_deref() == Ok("1");
+    let pid_report_fd: Option<i32> = std::env::var("ARAPUCA_PID_REPORT_FD")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    // The WRITE is parent-branch only: a write from the fork child
+    // would race four zero bytes (child_pid == 0) into the
+    // launcher's 4-byte read and corrupt target_pid (pidfd,
+    // --timeout, and the orphan sweep would all target the
+    // supervisor instead of the wrapper).
+
     if child_pid == 0 {
         // ── Wrapper child ──────────────────────────────────────
         // SAFETY: close the parent's socketpair end.
         unsafe { libc::close(sp_parent) };
+        // Plain mode: the supervisor owns the report pipe. Close
+        // the inherited copy so it cannot leak into the wrapper and
+        // target (in pidns mode the wrapper's relay is the writer
+        // and keeps it).
+        if let Some(fd) = pid_report_fd {
+            if !pidns_mode {
+                // SAFETY: fd is a valid pipe end in this fork child.
+                unsafe { libc::close(fd) };
+            }
+        }
         // Clear CLOEXEC on the pinned wrapper fd so execve of
         // /proc/self/fd/N resolves.
         // SAFETY: fcntl on a valid fd.
@@ -2824,12 +2905,44 @@ pub fn run_supervisor_mode(args: &[String]) -> ! {
         if unsafe { libc::getppid() } != supervisor_pid {
             unsafe { libc::_exit(1) };
         }
+        // Become our own SESSION leader (invariant 3, restored): the
+        // wrapper must not live in the supervisor's session. On tty
+        // runs it also takes the controlling terminal here — the
+        // launcher skipped TIOCSCTTY for exactly this. The wrapper's
+        // group is then orphaned (its parent, the supervisor, is in
+        // another session), which is what makes the kernel discard
+        // terminal stop signals for it: a SIGTSTP that stopped the
+        // target would never be SIGCONT'd by anyone, wedging the run
+        // until --timeout.
+        // SAFETY: setsid on self; fails EPERM only if already a
+        // session leader, which the parent's pre_exec setsid makes
+        // impossible here.
+        if unsafe { libc::setsid() } == -1 {
+            write_stderr("arapuca: supervisor: child setsid failed\n");
+            unsafe { libc::_exit(1) };
+        }
+        if std::env::var("ARAPUCA_SUPERVISOR_TTY").as_deref() == Ok("1") {
+            // SAFETY: TIOCSCTTY on stdin (the pty slave stdio the
+            // launcher wired). arg=0: do not steal — the slave is
+            // unowned (the supervisor never took it).
+            if unsafe { libc::ioctl(0, libc::TIOCSCTTY as libc::Ioctl, 0i32) } != 0 {
+                write_stderr("arapuca: supervisor: child TIOCSCTTY failed\n");
+                unsafe { libc::_exit(1) };
+            }
+        }
+
         // Env surgery: strip the supervisor-only vars, add the
         // socketpair end. The wrapper sees a clean launcher-shaped
-        // environment.
+        // environment. In plain mode the pid-report var goes too
+        // (the supervisor consumed the pipe); under ARAPUCA_PID_NS
+        // the wrapper's relay is the writer and keeps it.
         let sp_env = format!("ARAPUCA_UNOTIFY_SP_FD={sp_child}");
         let envp: Vec<std::ffi::CString> = std::env::vars_os()
-            .filter(|(k, _)| k != "ARAPUCA_SUPERVISOR" && k != "ARAPUCA_CGROUP_SYNC_FD")
+            .filter(|(k, _)| {
+                (pidns_mode || k != "ARAPUCA_PID_REPORT_FD")
+                    && k != "ARAPUCA_CGROUP_SYNC_FD"
+                    && k != "ARAPUCA_SUPERVISOR"
+            })
             .map(|(k, v)| {
                 let kv = format!("{}={}", k.to_string_lossy(), v.to_string_lossy());
                 std::ffi::CString::new(kv).unwrap_or_default()
@@ -2880,32 +2993,45 @@ pub fn run_supervisor_mode(args: &[String]) -> ! {
     // SAFETY: close the fork-child-side socketpair end.
     unsafe { libc::close(sp_child) };
 
-    // The wrapper becomes its own process-group leader; on tty runs
-    // it also becomes the terminal's foreground group (the target
-    // receives terminal signals, the supervisor does not, and the
-    // target's own setsid() fails EPERM as a group leader — the
-    // same observable behavior as the legacy topology).
-    // SAFETY: setpgid on a direct child.
-    if unsafe { libc::setpgid(child_pid, child_pid) } != 0 {
-        write_stderr("arapuca: supervisor: setpgid failed\n");
-        // Non-fatal: the sweep and tty degrade, the policy does not.
-    }
-    if std::env::var("ARAPUCA_SUPERVISOR_TTY").as_deref() == Ok("1") {
-        // tcsetpgrp from a process that is itself in a background
-        // process group raises SIGTTOU, and its default action STOPS
-        // the caller: the supervisor would hang here instead of
-        // reporting the failure and carrying on. Interactive shells
-        // ignore SIGTTOU around the same call for the same reason.
-        // SAFETY: signal disposition change with the default handler.
-        unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
-        // SAFETY: tcsetpgrp on stdin (the controlling terminal) —
-        // best effort.
-        unsafe {
-            if libc::tcsetpgrp(0, child_pid) != 0 {
-                write_stderr("arapuca: supervisor: tcsetpgrp failed\n");
-            }
+    // Fd hygiene (the plan's F4 closed-list): the supervisor is NOT
+    // the writer of the wrapper-audit or DNS-audit pipes — the
+    // wrapper is. Holding their write ends for the supervisor's
+    // lifetime keeps the launcher's read side from EOF until the
+    // target exits, so any audit-sink consumer's launch() blocks
+    // for the target's whole lifetime (no kill(), no timeouts, no
+    // stdin). The pinned wrapper fd is likewise child-only (the
+    // exec of /proc/self/fd/N); the parent's copy is dead weight.
+    // The unotify-audit fd is deliberately KEPT — the supervisor
+    // is its writer.
+    for var in ["ARAPUCA_AUDIT_FD", "ARAPUCA_DNS_AUDIT_FD"] {
+        if let Some(fd) = std::env::var(var).ok().and_then(|s| s.parse::<i32>().ok()) {
+            // SAFETY: fd inherited from the launcher; an EBADF from
+            // an already-closed descriptor is ignored.
+            unsafe { libc::close(fd) };
         }
     }
+    // SAFETY: the parent's copy of the pinned wrapper fd; the fork
+    // child kept its own for the execve.
+    unsafe { libc::close(wrapper_fd) };
+
+    // The pid report (plain mode): the supervisor is the writer.
+    // Parent-branch only — see the comment above the fork.
+    if let Some(fd) = pid_report_fd {
+        if !pidns_mode {
+            let bytes = child_pid.to_le_bytes();
+            // SAFETY: write of 4 bytes on the launcher's pipe.
+            let _ = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            // SAFETY: fd is a valid pipe end.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    // The wrapper is its own session and group leader (the fork child
+    // setsid'd above); on tty runs it holds the controlling terminal,
+    // so its group is the foreground group by construction. Nothing
+    // to steer from this side — and steering it (setpgid/tcsetpgrp
+    // from the supervisor's session) is exactly the shape that left
+    // the target's group un-orphaned and wedgeable by SIGTSTP.
 
     // Apply the supervisor's own seccomp allowlist AFTER the fork
     // (filters inherit across fork and exec — applying it earlier
