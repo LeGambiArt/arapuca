@@ -1678,3 +1678,96 @@ fn run_with_policy_bounded(extra_args: &[&str], target: &str) -> std::process::O
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn user_session_sockets_denied_only_when_opted_in() {
+    // systemd-run --user through /run/user/<uid>/bus starts a process
+    // outside every arapuca layer; by default the policy leaves it
+    // reachable (the built-in roots cover root-owned daemons only)
+    // and --deny-user-session-sockets opts into denying it.
+    if !python3_available() {
+        eprintln!("skipping: requires python3");
+        return;
+    }
+    if yama_scope_is_absolute() {
+        eprintln!("skipping: yama ptrace_scope=3 denies the supervisor inspection");
+        return;
+    }
+    let uid = unsafe { libc::getuid() };
+    let bus = format!("/run/user/{uid}/bus");
+    // A stand-in listener at the exact path the flag must deny. Only
+    // meaningful when the path exists and is bindable by this test
+    // (the real bus is usually present on desktop hosts; bind fails
+    // with EADDRINUSE then, which skips rather than lies).
+    let listener = match std::os::unix::net::UnixListener::bind(&bus) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("skipping: a real session bus is already bound at {bus}");
+            return;
+        }
+        Err(_) => {
+            eprintln!("skipping: {bus} not bindable here");
+            return;
+        }
+    };
+    let script = format!(
+        r#"
+import socket, errno
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+rc = s.connect_ex({bus:?})
+print("RC", rc)
+assert rc == errno.EACCES, rc
+print("SESSION_DENIED")
+"#
+    );
+    let out = run_with_policy(&["--deny-user-session-sockets"], &script);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("SESSION_DENIED"),
+        "the opt-in flag must deny the session bus: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(listener);
+
+    // Without the flag the same connect must be allowed (the socket
+    // is not root-owned and no deny root covers it).
+    let listener = std::os::unix::net::UnixListener::bind(&bus).expect("rebind");
+    let out = run_with_policy(&[], &script.replace("EACCES", "0"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success() || !stdout.contains("RC 13"),
+        "without the opt-in the session bus must stay reachable: {stdout}"
+    );
+    drop(listener);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn user_session_roots_present_only_when_opted_in() {
+    // Unit-level oracle for --deny-user-session-sockets: the CLI test
+    // skips on hosts with a live session bus, so the flag's actual
+    // effect on the deny roots is pinned here instead.
+    let base = arapuca::Profile {
+        unix_socket_connect_policy: arapuca::UnixSocketConnectPolicy::DenyPrivileged,
+        ..Default::default()
+    };
+    let (k, v) = arapuca::env::unotify_env(&base).expect("policy active produces config");
+    assert_eq!(k, "ARAPUCA_UNOTIFY_CONFIG");
+    let uid = unsafe { libc::getuid() };
+    let bus = format!("/run/user/{uid}/bus");
+    let systemd = format!("/run/user/{uid}/systemd/private");
+    assert!(
+        !v.contains(&bus),
+        "the session bus must stay reachable without the opt-in"
+    );
+    let opted_in = arapuca::Profile {
+        deny_user_session_sockets: true,
+        ..base.clone()
+    };
+    let (_, v2) = arapuca::env::unotify_env(&opted_in).expect("config");
+    assert!(
+        v2.contains(&bus) && v2.contains(&systemd),
+        "the opt-in must add both session roots: {v2}"
+    );
+}

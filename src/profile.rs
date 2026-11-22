@@ -217,6 +217,14 @@ pub struct Profile {
     /// be absolute and must not contain `:` or `,` (environment
     /// encoding). Nonexistent roots are kept literal.
     pub unix_socket_deny_roots: Vec<PathBuf>,
+    /// Opt-in: deny `connect()` to the same-user session daemons —
+    /// the user's D-Bus (`/run/user/<uid>/bus`) and the systemd user
+    /// manager (`/run/user/<uid>/systemd/private`). Without this,
+    /// `systemd-run --user` from inside the sandbox starts a process
+    /// outside every arapuca layer (Landlock, seccomp, cgroups); the
+    /// built-in deny roots deliberately cover only root-owned
+    /// daemons. Requires the unix socket connect policy.
+    pub deny_user_session_sockets: bool,
     /// Audit file access via seccomp user notification.
     ///
     /// Intercepts `openat`/`openat2`/`open`/`execve` syscalls and emits
@@ -342,7 +350,8 @@ impl Profile {
 
         let policy_active =
             self.unix_socket_connect_policy == UnixSocketConnectPolicy::DenyPrivileged;
-        let roots_explicit = !self.unix_socket_deny_roots.is_empty();
+        let roots_explicit =
+            !self.unix_socket_deny_roots.is_empty() || self.deny_user_session_sockets;
 
         if policy_active
             && (!cfg!(seccomp_supported) || !matches!(self.isolation, Isolation::Process))

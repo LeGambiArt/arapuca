@@ -473,6 +473,18 @@ pub fn unotify_env(profile: &crate::Profile) -> Option<(String, String)> {
         #[cfg(seccomp_supported)]
         {
             let mut roots = crate::unotify::builtin_unix_deny_roots();
+            // Opt-in same-user session daemons: the user bus and the
+            // systemd user manager can start processes outside every
+            // arapuca layer (systemd-run --user). The uid is the
+            // launcher's real one — the host-side path is
+            // /run/user/<real-uid>/ even inside a --map-root-user
+            // namespace.
+            if profile.deny_user_session_sockets {
+                // SAFETY: getuid takes no arguments.
+                let uid = unsafe { libc::getuid() };
+                roots.push(format!("/run/user/{uid}/bus"));
+                roots.push(format!("/run/user/{uid}/systemd/private"));
+            }
             for root in &profile.unix_socket_deny_roots {
                 let literal = root.to_string_lossy().into_owned();
                 roots.push(literal.clone());

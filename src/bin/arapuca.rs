@@ -784,6 +784,7 @@ fn run_subcommand(args: &[String]) {
     let mut deny_unix_sockets = false;
     let mut unix_socket_connect_policy = arapuca::UnixSocketConnectPolicy::AllowAll;
     let mut unix_socket_deny_roots: Vec<PathBuf> = Vec::new();
+    let mut deny_user_session_sockets = false;
     #[cfg(unix)]
     let mut tty = false;
     #[cfg(target_os = "linux")]
@@ -856,6 +857,11 @@ fn run_subcommand(args: &[String]) {
             eprintln!(
                 "                     (docker, podman system, dbus, libvirt, ...; \
                  Linux only)"
+            );
+            eprintln!(
+                "  --deny-user-session-sockets  also deny connect() to the \
+                 same-user session daemons (user bus, systemd --user; \
+                 requires --deny-privileged-unix-sockets)"
             );
             eprintln!(
                 "  --unix-socket-deny-root PATH   add a deny root for the unix \
@@ -1111,6 +1117,9 @@ fn run_subcommand(args: &[String]) {
             "--allow-unix-socket-connect" => {
                 unix_socket_connect_policy = arapuca::UnixSocketConnectPolicy::AllowAll;
             }
+            "--deny-user-session-sockets" => {
+                deny_user_session_sockets = true;
+            }
             "--unix-socket-deny-root" => {
                 i += 1;
                 let root = flag_args.get(i).unwrap_or_else(|| {
@@ -1331,6 +1340,7 @@ fn run_subcommand(args: &[String]) {
         deny_unix_sockets,
         unix_socket_connect_policy,
         unix_socket_deny_roots,
+        deny_user_session_sockets,
         audit_file_access: audit_files,
         audit_network: audit_network || deny_network,
         seccomp_debug,
