@@ -1425,3 +1425,43 @@ fn proxy_socket_flag_validation() {
     assert_eq!(out.status.code(), Some(125), "stderr: {stderr}");
     assert!(stderr.contains("mutually exclusive"), "{stderr}");
 }
+
+#[test]
+fn proxy_socket_exports_no_proxy_for_loopback() {
+    // The bridge exports HTTP(S)_PROXY pointing at itself. Loopback
+    // must be excluded from proxying: the bridge is the namespace's
+    // only loopback listener, so routing a loopback destination
+    // through it loops back into the bridge. Env-honoring clients
+    // that CONNECT-tunnel http origins (undici's EnvHttpProxyAgent
+    // with proxyTunnel, i.e. the pi agent runtime) would otherwise
+    // wrap their bridge-directed API traffic in a CONNECT the far
+    // end of the relay cannot answer.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("relay.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let out = Command::new(arapuca_bin())
+        .args(["run", "--proxy-socket"])
+        .arg(&sock)
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("env | grep -i proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(
+        stdout.contains("HTTP_PROXY=http://127.0.0.1:18080"),
+        "proxy var not exported: {stdout}"
+    );
+    for var in ["NO_PROXY", "no_proxy"] {
+        assert!(
+            stdout.contains(&format!("{var}=127.0.0.1,localhost,::1")),
+            "{var} must exclude loopback: {stdout}"
+        );
+    }
+}
