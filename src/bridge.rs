@@ -526,14 +526,14 @@ fn child_stderr(msg: &str) {
 }
 
 #[cfg(seccomp_supported)]
-const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
+pub(crate) const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
     | libc::CLONE_FS
     | libc::CLONE_FILES
     | libc::CLONE_SIGHAND
     | libc::CLONE_THREAD) as u64;
 
 #[cfg(seccomp_supported)]
-const CLONE_NS_FLAGS: u64 = libc::CLONE_NEWNS as u64
+pub(crate) const CLONE_NS_FLAGS: u64 = libc::CLONE_NEWNS as u64
     | libc::CLONE_NEWCGROUP as u64
     | libc::CLONE_NEWUTS as u64
     | libc::CLONE_NEWIPC as u64

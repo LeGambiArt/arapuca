@@ -485,6 +485,8 @@ pub fn parse_unotify_config() -> Option<crate::unotify::UnotifyConfig> {
         bridge_port,
         dns_port,
         enforce_network,
+        enforce_unix_connect: false,
+        unix_deny_roots: Vec::new(),
     })
 }
 
