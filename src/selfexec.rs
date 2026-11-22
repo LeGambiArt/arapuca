@@ -215,36 +215,57 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
     // The supervisor reads /proc/<pid>/mem which Landlock
     // excludes, and must be in the host PID namespace.
     #[cfg(seccomp_supported)]
-    let unotify_config = crate::env::parse_unotify_config();
+    let unotify_config = match crate::env::parse_unotify_config() {
+        Ok(config) => config,
+        Err(e) => {
+            write_stderr(&format!("arapuca: selfexec: {e}\n"));
+            unsafe { libc::_exit(125) };
+        }
+    };
     #[cfg(seccomp_supported)]
     let unotify_fds = {
         if let Some(ref config) = unotify_config {
-            if crate::unotify::unotify_available() {
-                let unotify_audit_fd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
-                    .ok()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(-1);
-                if unotify_audit_fd >= 0 {
-                    match crate::unotify::fork_unotify_supervisor(
-                        config,
-                        unotify_audit_fd,
-                        seccomp_debug,
-                    ) {
-                        Ok(fds) => {
-                            audit_layer(audit_fd, "UnotifySupervisor", true, None);
-                            Some(fds)
-                        }
-                        Err(e) => {
-                            audit_layer(audit_fd, "UnotifySupervisor", false, Some(&e.to_string()));
-                            write_stderr(&format!("arapuca: selfexec: unotify supervisor: {e}\n"));
-                            None
-                        }
+            // Fail-closed for the UDS connect policy. The probe is
+            // the CHILD-topology direction (this wrapper forks its
+            // own supervisor, which inspects its parent) — NOT the
+            // plain parent→child probe the launcher uses.
+            if config.enforce_unix_connect
+                && (!crate::unotify::unotify_available_child_topology()
+                    || !crate::unotify::addfd_available())
+            {
+                write_stderr(
+                    "arapuca: selfexec: unix socket connect policy requires seccomp \
+                     user notification with NOTIF_ADDFD support\n",
+                );
+                write_stderr(
+                    "arapuca: selfexec: opt out with \
+                     --allow-unix-socket-connect (policy left unenforced)\n",
+                );
+                unsafe { libc::_exit(125) };
+            }
+            // The audit pipe is optional: policy-only runs pass -1.
+            let unotify_audit_fd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(-1);
+            match crate::unotify::fork_unotify_supervisor(config, unotify_audit_fd, seccomp_debug) {
+                Ok(fds) => {
+                    audit_layer(audit_fd, "UnotifySupervisor", true, None);
+                    Some(fds)
+                }
+                Err(e) => {
+                    if config.enforce_unix_connect {
+                        write_stderr(&format!("arapuca: selfexec: unotify supervisor: {e}\n"));
+                        write_stderr(
+                            "arapuca: selfexec: refusing to run without the unix \
+                             socket connect policy enforced\n",
+                        );
+                        unsafe { libc::_exit(125) };
                     }
-                } else {
+                    audit_layer(audit_fd, "UnotifySupervisor", false, Some(&e.to_string()));
+                    write_stderr(&format!("arapuca: selfexec: unotify supervisor: {e}\n"));
                     None
                 }
-            } else {
-                None
             }
         } else {
             None
@@ -382,7 +403,14 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
             Some(v) if v == OsStr::new("baseline") => crate::SeccompProfile::Baseline,
             _ => crate::SeccompProfile::Strict,
         };
-        if let Err(e) = crate::seccomp::apply(&seccomp_profile, deny_unix_sockets) {
+        // Block PR_SET_DUMPABLE(0) whenever ANY unotify feature is
+        // active, matching the wrapper: a non-dumpable target is
+        // invisible to the audit supervisor (silent skip, no record),
+        // and the policy case additionally turns it into an EACCES.
+        let block_dumpable_zero = unotify_config.is_some();
+        if let Err(e) =
+            crate::seccomp::apply(&seccomp_profile, deny_unix_sockets, block_dumpable_zero)
+        {
             audit_layer(audit_fd, "Seccomp", false, Some(&e.to_string()));
             write_stderr(&format!("arapuca: selfexec: seccomp: {e}\n"));
             unsafe { libc::_exit(1) };
@@ -397,50 +425,90 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
     // ── Install USER_NOTIF filter LAST + send listener FD ────────
     #[cfg(seccomp_supported)]
     if let Some(ref fds) = unotify_fds {
-        if crate::unotify::poll_readiness(fds.readiness_read, 5000).is_ok() {
-            unsafe { libc::close(fds.readiness_read) };
-            if let Some(ref config) = unotify_config {
-                let syscalls =
-                    crate::unotify::target_syscalls(config.audit_file_access, config.audit_network);
-                // The host PID is needed by the supervisor for
-                // pidfd_open(). In a PID namespace, getpid() returns
-                // the namespace-local PID (1), so we use the host PID
-                // piped from fork_into_pidns(). Outside a PID namespace,
-                // read_host_pid() reads /proc/self/stat — must happen
-                // BEFORE install_unotify_filter() because the filter
-                // intercepts openat and would deadlock.
-                let host_pid = pidns_host_pid.unwrap_or_else(crate::unotify::read_host_pid);
-                match crate::unotify::build_unotify_bpf(&syscalls)
-                    .and_then(|bpf| crate::unotify::install_unotify_filter(&bpf))
-                {
-                    Ok(listener_fd) => {
-                        let mut msg = [0u8; 8];
-                        msg[..4].copy_from_slice(&host_pid.to_ne_bytes());
-                        msg[4..].copy_from_slice(&listener_fd.to_ne_bytes());
-                        if !crate::unotify::write_all_raw(fds.socketpair_parent, &msg) {
-                            write_stderr(&format!(
-                                "arapuca: selfexec: send unotify fd: {}\n",
-                                std::io::Error::last_os_error()
-                            ));
-                            unsafe { libc::_exit(1) };
+        let policy_active = unotify_config
+            .as_ref()
+            .is_some_and(|c| c.enforce_unix_connect);
+        match crate::unotify::poll_readiness(fds.readiness_read, 5000) {
+            Ok(()) => {
+                unsafe { libc::close(fds.readiness_read) };
+                if let Some(ref config) = unotify_config {
+                    let syscalls = crate::unotify::target_syscalls(
+                        config.audit_file_access,
+                        config.audit_network,
+                        config.enforce_unix_connect,
+                    );
+                    // The host PID is needed by the supervisor for
+                    // pidfd_open(). In a PID namespace, getpid() returns
+                    // the namespace-local PID (1), so we use the host PID
+                    // piped from fork_into_pidns(). Outside a PID namespace,
+                    // read_host_pid() reads /proc/self/stat — must happen
+                    // BEFORE install_unotify_filter() because the filter
+                    // intercepts openat and would deadlock.
+                    let host_pid = pidns_host_pid.unwrap_or_else(crate::unotify::read_host_pid);
+                    // Under the UDS connect policy, arch-mismatched
+                    // entries (int 0x80 compat) must die instead of
+                    // bypassing the broker.
+                    let build = if config.enforce_unix_connect {
+                        crate::unotify::build_unotify_bpf_kill_arch
+                    } else {
+                        crate::unotify::build_unotify_bpf
+                    };
+                    match build(&syscalls)
+                        .and_then(|bpf| crate::unotify::install_unotify_filter(&bpf))
+                    {
+                        Ok(listener_fd) => {
+                            let mut msg = [0u8; 8];
+                            msg[..4].copy_from_slice(&host_pid.to_ne_bytes());
+                            msg[4..].copy_from_slice(&listener_fd.to_ne_bytes());
+                            if !crate::unotify::write_all_raw(fds.socketpair_parent, &msg) {
+                                write_stderr(&format!(
+                                    "arapuca: selfexec: send unotify fd: {}\n",
+                                    std::io::Error::last_os_error()
+                                ));
+                                unsafe { libc::_exit(1) };
+                            }
+                            unsafe {
+                                libc::close(fds.socketpair_parent);
+                            }
                         }
-                        unsafe {
-                            libc::close(fds.socketpair_parent);
+                        Err(e) => {
+                            if policy_active {
+                                write_stderr(&format!("arapuca: selfexec: unotify filter: {e}\n"));
+                                write_stderr(
+                                    "arapuca: selfexec: refusing to run without the \
+                                     unix socket connect policy enforced\n",
+                                );
+                                unsafe {
+                                    libc::close(fds.socketpair_parent);
+                                    libc::_exit(125);
+                                }
+                            }
+                            write_stderr(&format!("arapuca: selfexec: unotify filter: {e}\n"));
+                            unsafe { libc::close(fds.socketpair_parent) };
                         }
                     }
-                    Err(e) => {
-                        write_stderr(&format!("arapuca: selfexec: unotify filter: {e}\n"));
-                        unsafe { libc::close(fds.socketpair_parent) };
+                } else {
+                    unsafe { libc::close(fds.socketpair_parent) };
+                }
+            }
+            Err(e) => {
+                if policy_active {
+                    write_stderr(&format!("arapuca: selfexec: unotify supervisor: {e}\n"));
+                    write_stderr(
+                        "arapuca: selfexec: refusing to run without the unix socket \
+                         connect policy enforced\n",
+                    );
+                    unsafe {
+                        libc::close(fds.readiness_read);
+                        libc::close(fds.socketpair_parent);
+                        libc::_exit(125);
                     }
                 }
-            } else {
-                unsafe { libc::close(fds.socketpair_parent) };
-            }
-        } else {
-            write_stderr("arapuca: selfexec: unotify supervisor readiness timeout\n");
-            unsafe {
-                libc::close(fds.readiness_read);
-                libc::close(fds.socketpair_parent);
+                write_stderr("arapuca: selfexec: unotify supervisor readiness timeout\n");
+                unsafe {
+                    libc::close(fds.readiness_read);
+                    libc::close(fds.socketpair_parent);
+                }
             }
         }
     }

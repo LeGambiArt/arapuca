@@ -218,6 +218,33 @@ pub enum AuditEvent {
         detail: Option<String>,
     },
 
+    /// A sandboxed process attempted a Unix-socket connect denied by
+    /// the UDS connect policy (`unix_socket_connect_policy`).
+    ///
+    /// Observed by the seccomp-unotify connect broker before the
+    /// notification response is sent. `path` is the peer's bound
+    /// path (or empty for inspection failures, where `detail`
+    /// carries the failure reason).
+    #[non_exhaustive]
+    UnixSocketBlocked {
+        timestamp: AuditTimestamp,
+        pid: u32,
+        path: String,
+        syscall: String,
+        detail: Option<String>,
+    },
+
+    /// A sandboxed process's intercepted syscall could not be
+    /// inspected (re-parented descendant on a plain Yama-1 run, a
+    /// non-dumpable exec): it was continued without an audit record.
+    /// Emitted so the observability gap is visible instead of silent.
+    InspectionFailed {
+        timestamp: AuditTimestamp,
+        pid: u32,
+        /// Syscall number, as text.
+        syscall: String,
+    },
+
     /// File opened by the sandboxed process.
     ///
     /// Observed via seccomp user notification (`SECCOMP_RET_USER_NOTIF`)

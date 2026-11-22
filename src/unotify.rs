@@ -181,8 +181,13 @@ fn build_unotify_bpf_impl(
     Ok(prog)
 }
 
-/// Collect the syscall numbers to intercept based on the audit config.
-pub fn target_syscalls(audit_file_access: bool, audit_network: bool) -> Vec<i64> {
+/// Collect the syscall numbers to intercept based on the audit config
+/// and the UDS connect policy.
+pub fn target_syscalls(
+    audit_file_access: bool,
+    audit_network: bool,
+    enforce_unix_connect: bool,
+) -> Vec<i64> {
     let mut syscalls = Vec::new();
 
     if audit_file_access {
@@ -200,6 +205,10 @@ pub fn target_syscalls(audit_file_access: bool, audit_network: bool) -> Vec<i64>
         syscalls.push(libc::SYS_sendto);
         syscalls.push(libc::SYS_sendmsg);
         syscalls.push(libc::SYS_sendmmsg);
+    } else if enforce_unix_connect {
+        // The connect broker intercepts connect() even without the
+        // audit-network feature.
+        syscalls.push(libc::SYS_connect);
     }
 
     syscalls
@@ -1952,6 +1961,86 @@ pub fn unotify_available() -> bool {
     *AVAILABLE.get_or_init(probe_unotify_support)
 }
 
+static AVAILABLE_CHILD_TOPOLOGY: OnceLock<bool> = OnceLock::new();
+
+/// Availability for the legacy child topology (selfexec): there the
+/// supervisor is the target's child and must inspect its PARENT, which
+/// Yama `ptrace_scope >= 1` denies without a user namespace.
+///
+/// Cached on its own: a cached availability answer must never be
+/// shared between probes that ask different questions.
+pub fn unotify_available_child_topology() -> bool {
+    *AVAILABLE_CHILD_TOPOLOGY.get_or_init(|| probe_proc_mem_access() && probe_seccomp_unotify())
+}
+
+static ADDFD_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+/// Check if the kernel supports `SECCOMP_IOCTL_NOTIF_ADDFD`
+/// (kernel ≥ 5.9), required by the connect broker's socket delivery.
+///
+/// Probed independently of [`unotify_available`] — audit-only
+/// features work on 5.5+ kernels without ADDFD; the UDS connect
+/// policy does not, and must fail closed when it is missing.
+pub fn addfd_available() -> bool {
+    *ADDFD_AVAILABLE.get_or_init(probe_addfd_support)
+}
+
+fn probe_addfd_support() -> bool {
+    // Install a USER_NOTIF filter in a clone child and issue an
+    // ADDFD ioctl with a stale notification id: an unknown ioctl
+    // returns ENOTTY (pre-5.9 kernel); a known one returns a stale-id
+    // error instead. The filter must exist for the ioctl to be
+    // meaningful on the listener fd.
+    let bpf = match build_unotify_bpf(&[libc::SYS_getpid]) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    // SAFETY: fork with a pre-allocated BPF program; the child only
+    // uses the inherited COW copy.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return false;
+    }
+    if pid == 0 {
+        // SAFETY: prctl with scalar arguments.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1i64, 0i64, 0i64, 0i64) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+        match install_unotify_filter(&bpf) {
+            Ok(fd) => {
+                let addfd = SeccompNotifAddfd {
+                    // Stale id: can never match a live notification.
+                    id: u64::MAX,
+                    flags: 0,
+                    srcfd: fd as u32,
+                    newfd: 0,
+                    newfd_flags: 0,
+                };
+                // SAFETY: ioctl on the listener fd returned above.
+                let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd) };
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                // "Supported" is the stale-id answer (ENOENT): the
+                // ioctl exists and processed the request. ENOTTY is
+                // the pre-5.9 unknown-ioctl answer, but seccomp's
+                // ioctl dispatcher returns EINVAL for unknown
+                // commands there too (measured on 6.18; the
+                // dispatcher's default case), so EINVAL is also
+                // "unsupported" — treating it as support would pass
+                // the launch-time check and then fail every connect
+                // at run time.
+                let supported = ret < 0 && errno == Some(libc::ENOENT);
+                // SAFETY: fd is a valid listener descriptor.
+                unsafe { libc::close(fd) };
+                unsafe { libc::_exit(if supported { 0 } else { 1 }) };
+            }
+            Err(_) => unsafe { libc::_exit(1) },
+        }
+    }
+    let mut status: libc::c_int = 0;
+    let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+    ret > 0 && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+}
+
 fn probe_unotify_support() -> bool {
     // Phase 1: Check that we can read a sibling process's /proc/<pid>/mem.
     // This catches Yama ptrace_scope=1 without a user namespace.
@@ -2099,6 +2188,12 @@ pub fn builtin_unix_deny_roots() -> Vec<String> {
         "/run/systemd/private",
         "/run/lxd",
         "/var/lib/lxd/unix.socket",
+        // Snap LXD: the daemon binds under /var/snap, group lxd —
+        // root-equivalent on hosts where the user is in that group.
+        "/var/snap/lxd/common/lxd",
+        // Incus (the LXD fork): group incus-admin, same escape shape.
+        "/var/lib/incus",
+        "/run/incus",
         "/run/snapd.socket",
         "/run/snapd-snap.socket",
     ]
@@ -2652,7 +2747,7 @@ mod tests {
 
     #[test]
     fn target_syscalls_file_access() {
-        let syscalls = target_syscalls(true, false);
+        let syscalls = target_syscalls(true, false, false);
         assert!(syscalls.contains(&libc::SYS_openat));
         assert!(syscalls.contains(&437)); // openat2
         assert!(syscalls.contains(&libc::SYS_execve));
@@ -2662,7 +2757,7 @@ mod tests {
 
     #[test]
     fn target_syscalls_network() {
-        let syscalls = target_syscalls(false, true);
+        let syscalls = target_syscalls(false, true, false);
         assert!(syscalls.contains(&libc::SYS_connect));
         assert!(syscalls.contains(&libc::SYS_sendto));
         assert!(syscalls.contains(&libc::SYS_sendmsg));
@@ -2672,21 +2767,34 @@ mod tests {
 
     #[test]
     fn target_syscalls_both() {
-        let syscalls = target_syscalls(true, true);
+        let syscalls = target_syscalls(true, true, false);
         assert!(syscalls.contains(&libc::SYS_openat));
         assert!(syscalls.contains(&libc::SYS_connect));
     }
 
     #[test]
     fn target_syscalls_neither() {
-        let syscalls = target_syscalls(false, false);
+        let syscalls = target_syscalls(false, false, false);
         assert!(syscalls.is_empty());
+    }
+
+    #[test]
+    fn target_syscalls_uds_policy() {
+        // The connect broker intercepts connect() even without the
+        // audit-network feature.
+        let syscalls = target_syscalls(false, false, true);
+        assert!(syscalls.contains(&libc::SYS_connect));
+        assert!(!syscalls.contains(&libc::SYS_sendto));
+        assert!(!syscalls.contains(&libc::SYS_openat));
+        // With audit_network, no duplicates.
+        let both = target_syscalls(false, true, true);
+        assert_eq!(both.iter().filter(|&&n| n == libc::SYS_connect).count(), 1);
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn target_syscalls_includes_open_on_x86_64() {
-        let syscalls = target_syscalls(true, false);
+        let syscalls = target_syscalls(true, false, false);
         assert!(syscalls.contains(&libc::SYS_open));
     }
 

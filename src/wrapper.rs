@@ -27,6 +27,22 @@ pub fn validate_unix_socket_policy(
     direct_apply: bool,
 ) -> crate::Result<()> {
     profile.validate_unix_socket_policy()?;
+    // The connect policy needs the unotify supervisor, which only
+    // the launch topology spawns. Direct apply (arapuca_apply) has
+    // no broker: an explicit DenyPrivileged request must fail
+    // closed here instead of installing a policy that silently
+    // does nothing — the C header documents unsupported requests
+    // as errors.
+    if direct_apply
+        && profile.unix_socket_connect_policy == crate::UnixSocketConnectPolicy::DenyPrivileged
+    {
+        return Err(crate::Error::Validation(
+            "unix socket connect policy requires the unotify supervisor and cannot be \
+             enforced by direct apply; opt out with \
+             unix_socket_connect_policy = AllowAll"
+                .into(),
+        ));
+    }
     #[cfg(seccomp_supported)]
     if profile.deny_unix_sockets {
         if direct_apply {

@@ -179,6 +179,32 @@ pub struct Profile {
     /// Linux x86_64/aarch64 process isolation. Unsupported requests fail.
     /// Runtimes using Unix sockets or socketpairs may require this off.
     pub deny_unix_sockets: bool,
+    /// Selective Unix-socket connect policy (Linux process isolation
+    /// only).
+    ///
+    /// `DenyPrivileged` (opt-in) brokers every `connect()` through the
+    /// seccomp-unotify supervisor: connects to well-known privileged
+    /// daemon sockets (docker, podman system, containerd, CRI-O, dbus
+    /// system bus, libvirt, systemd manager, LXD, snapd) are denied
+    /// with `EACCES`; everything else — including rootless daemon
+    /// sockets under `/run/user/<uid>/` — keeps working. Landlock,
+    /// seccomp, and network namespaces do not confine `connect()` to
+    /// pathname Unix sockets, so without this policy a sandboxed
+    /// process can drive a root-owned daemon (e.g. the docker daemon)
+    /// and escape all confinement.
+    ///
+    /// Requires kernel ≥ 5.9 (seccomp `NOTIF_ADDFD`) and a supervisor
+    /// that can inspect the target (a user namespace via `use_netns`/
+    /// `use_pidns`, or Yama `ptrace_scope` = 0). When the policy is
+    /// active but the supervisor cannot run, the launch fails — the
+    /// target never runs unenforced.
+    pub unix_socket_connect_policy: UnixSocketConnectPolicy,
+    /// Extra deny roots for [`Profile::unix_socket_connect_policy`]:
+    /// a connect is denied when the peer's bound path equals a root
+    /// or lies beneath it. Merged with the built-in list. Paths must
+    /// be absolute and must not contain `:` or `,` (environment
+    /// encoding). Nonexistent roots are kept literal.
+    pub unix_socket_deny_roots: Vec<PathBuf>,
     /// Audit file access via seccomp user notification.
     ///
     /// Intercepts `openat`/`openat2`/`open`/`execve` syscalls and emits
@@ -263,8 +289,77 @@ impl Profile {
                 "Unix socket denial requires Linux x86_64/aarch64 process isolation".into(),
             ));
         }
+        self.validate_unix_connect_policy()
+    }
+
+    /// Validate the Unix socket connect policy and its deny roots.
+    ///
+    /// Fail-closed: an explicitly requested `DenyPrivileged` policy on
+    /// an unsupported platform/isolation is an error, never a silent
+    /// no-op, and explicitly configured deny roots are rejected where
+    /// they cannot be enforced (including MicroVm, where host sockets
+    /// are unreachable and the roots would be silently dropped).
+    fn validate_unix_connect_policy(&self) -> crate::Result<()> {
+        use std::fmt::Write as _;
+
+        let policy_active =
+            self.unix_socket_connect_policy == UnixSocketConnectPolicy::DenyPrivileged;
+        let roots_explicit = !self.unix_socket_deny_roots.is_empty();
+
+        if policy_active
+            && (!cfg!(seccomp_supported) || !matches!(self.isolation, Isolation::Process))
+        {
+            let mut msg = String::from(
+                "unix socket connect policy requires \
+                 Linux x86_64/aarch64 process isolation",
+            );
+            if !cfg!(seccomp_supported) {
+                let _ = write!(msg, "; opt out with unix_socket_connect_policy = AllowAll");
+            }
+            return Err(crate::Error::Validation(msg));
+        }
+        if roots_explicit && !policy_active {
+            return Err(crate::Error::Validation(
+                "unix_socket_deny_roots requires \
+                 unix_socket_connect_policy = DenyPrivileged"
+                    .into(),
+            ));
+        }
+        for root in &self.unix_socket_deny_roots {
+            if root.as_os_str().is_empty() {
+                return Err(crate::Error::Validation(
+                    "unix socket deny root was not a valid path \
+                     (NULL or non-UTF-8 from the caller)"
+                        .into(),
+                ));
+            }
+            if !root.is_absolute() {
+                return Err(crate::Error::Validation(format!(
+                    "unix socket deny root must be absolute: {}",
+                    root.display()
+                )));
+            }
+            let s = root.to_string_lossy();
+            if s.contains(':') || s.contains(',') {
+                return Err(crate::Error::Validation(format!(
+                    "unix socket deny root must not contain ':' or ',': {s}"
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+/// Selective Unix-socket connect policy. See
+/// [`Profile::unix_socket_connect_policy`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnixSocketConnectPolicy {
+    /// Broker `connect()` and deny privileged daemon sockets.
+    DenyPrivileged,
+    /// Legacy behavior: no connect() brokering.
+    #[default]
+    AllowAll,
 }
 
 #[cfg(test)]

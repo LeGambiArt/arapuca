@@ -1199,6 +1199,70 @@ pub unsafe extern "C" fn arapuca_profile_set_deny_unix_sockets(
     }
 }
 
+/// Set the Unix socket connect policy (Linux process isolation only).
+/// Pass `enabled = true` for `DenyPrivileged` (deny connects to
+/// privileged daemon sockets via the unotify connect broker), or
+/// `false` for `AllowAll` (legacy behavior). Unsupported
+/// `DenyPrivileged` requests fail at launch/application.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_unix_socket_connect_policy(
+    profile: *mut ArapucaProfile,
+    enabled: bool,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.unix_socket_connect_policy = if enabled {
+                crate::profile::UnixSocketConnectPolicy::DenyPrivileged
+            } else {
+                crate::profile::UnixSocketConnectPolicy::AllowAll
+            };
+        }
+    }
+}
+
+/// Add a deny root for the Unix socket connect policy (merged with
+/// the built-in list). The path must be absolute and must not
+/// contain `:` or `,`; invalid paths fail at launch/application.
+/// No-op when the policy is `AllowAll` at launch time (roots
+/// configured without the policy fail validation).
+///
+/// A NULL or non-UTF-8 `root` is recorded as an invalid entry, so the
+/// next launch fails validation instead of running with a deny root
+/// silently missing. This function cannot report the error itself
+/// (the ABI returns void).
+///
+/// # Safety
+/// `profile` must be a valid pointer; `root` must be a valid
+/// NUL-terminated C string, or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_add_unix_socket_deny_root(
+    profile: *mut ArapucaProfile,
+    root: *const c_char,
+) {
+    let Some(profile) = (unsafe { profile.as_mut() }) else {
+        return;
+    };
+    let Some(inner) = profile.inner.as_mut() else {
+        return;
+    };
+    // SAFETY: root is a valid NUL-terminated C string per contract.
+    let root = (unsafe { root.as_ref() }).and_then(|c| {
+        // SAFETY: c points at the first byte of the NUL-terminated
+        // string above.
+        (unsafe { std::ffi::CStr::from_ptr(c) }).to_str().ok()
+    });
+    // An unusable path is pushed as an empty entry: validation rejects
+    // it, so a deny root is never dropped in silence. A security
+    // setting that disappears without a word is worse than a launch
+    // that fails.
+    inner
+        .unix_socket_deny_roots
+        .push(std::path::PathBuf::from(root.unwrap_or("")));
+}
+
 /// Apply sandbox restrictions to the current process. Fail-closed.
 /// Returns 0 on success, -1 on error.
 ///
@@ -1246,9 +1310,17 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
         return -1;
     }
     #[cfg(seccomp_supported)]
-    if let Err(e) = crate::seccomp::apply(&inner.seccomp_profile, inner.deny_unix_sockets) {
-        set_error(&format!("seccomp: {e}"));
-        return -1;
+    {
+        let block_dumpable_zero = inner.unix_socket_connect_policy
+            == crate::profile::UnixSocketConnectPolicy::DenyPrivileged;
+        if let Err(e) = crate::seccomp::apply(
+            &inner.seccomp_profile,
+            inner.deny_unix_sockets,
+            block_dumpable_zero,
+        ) {
+            set_error(&format!("seccomp: {e}"));
+            return -1;
+        }
     }
     #[cfg(all(target_os = "linux", not(seccomp_supported)))]
     log::warn!("seccomp not available on this architecture");
@@ -1548,6 +1620,36 @@ mod tests {
         let p = arapuca_profile_new();
         assert!(!p.is_null());
         unsafe { arapuca_profile_free(p) };
+    }
+
+    // Linux-only by reachability, not by code: the platform gate in
+    // validate_unix_socket_policy fires before the deny-roots loop, so
+    // on non-Linux the poisoned root is masked by the "requires Linux
+    // process isolation" error (fail-closed either way).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rejected_deny_root_fails_the_next_launch() {
+        // The setter cannot report an error (void ABI), so a path it
+        // cannot use must poison the profile rather than vanish.
+        let p = arapuca_profile_new();
+        assert!(!p.is_null());
+        unsafe {
+            arapuca_profile_set_unix_socket_connect_policy(p, true);
+            // NULL root: the shape a caller gets from an allocation
+            // failure, and the one an inattentive binding passes.
+            arapuca_profile_add_unix_socket_deny_root(p, std::ptr::null());
+            let err = (*p)
+                .inner
+                .as_ref()
+                .unwrap()
+                .validate_unix_socket_policy()
+                .expect_err("an unusable deny root must fail validation");
+            assert!(
+                err.to_string().contains("not a valid path"),
+                "unexpected error: {err}"
+            );
+            arapuca_profile_free(p);
+        }
     }
 
     #[test]

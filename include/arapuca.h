@@ -261,8 +261,7 @@ void arapuca_profile_set_netns(struct arapuca_ArapucaProfile *profile, bool enab
  * # Safety
  * `profile` must be a valid pointer.
  */
-void arapuca_profile_set_network_listeners(struct arapuca_ArapucaProfile *profile,
-                                           bool enabled);
+void arapuca_profile_set_network_listeners(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
  * Set the seccomp profile for the sandboxed process.
@@ -606,6 +605,33 @@ void arapuca_process_cleanup(struct arapuca_ArapucaProcess *proc);
  * `profile` must be a valid pointer.
  */
 void arapuca_profile_set_deny_unix_sockets(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
+ * Set the Unix socket connect policy (Linux process isolation only).
+ * Pass `enabled = true` for `DenyPrivileged` (deny connects to
+ * privileged daemon sockets via the unotify connect broker), or
+ * `false` for `AllowAll` (legacy behavior). Unsupported
+ * `DenyPrivileged` requests fail at launch/application.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_unix_socket_connect_policy(struct arapuca_ArapucaProfile *profile,
+                                                    bool enabled);
+
+/**
+ * Add a deny root for the Unix socket connect policy (merged with
+ * the built-in list). The path must be absolute and must not
+ * contain `:` or `,`; invalid paths fail at launch/application.
+ * No-op when the policy is `AllowAll` at launch time (roots
+ * configured without the policy fail validation).
+ *
+ * # Safety
+ * `profile` must be a valid pointer; `root` must be a valid
+ * NUL-terminated C string.
+ */
+void arapuca_profile_add_unix_socket_deny_root(struct arapuca_ArapucaProfile *profile,
+                                               const char *root);
 
 /**
  * Apply sandbox restrictions to the current process. Fail-closed.

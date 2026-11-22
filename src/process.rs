@@ -609,7 +609,11 @@ impl Process {
                     #[serde(default)]
                     syscall: Option<String>,
                     #[serde(default)]
+                    reason: Option<String>,
+                    #[serde(default)]
                     count: Option<u64>,
+                    #[serde(default)]
+                    nr: Option<i64>,
                 }
                 match serde_json::from_str::<UnotifyLine>(line) {
                     Ok(entry) => {
@@ -645,6 +649,28 @@ impl Process {
                                         .unwrap_or_else(|| "tcp".into()),
                                 ),
                                 detail: Some("unotify".into()),
+                            }),
+                            "unix_socket_blocked" => ctx.emit(AuditEvent::UnixSocketBlocked {
+                                timestamp: ctx.timestamp(),
+                                pid: event_pid,
+                                path: crate::audit::sanitize_audit_string(
+                                    &entry.path.unwrap_or_default(),
+                                ),
+                                syscall: crate::audit::sanitize_audit_string(
+                                    &entry.syscall.unwrap_or_else(|| "connect".into()),
+                                ),
+                                detail: entry
+                                    .reason
+                                    .map(|r| crate::audit::sanitize_audit_string(&r)),
+                            }),
+                            "inspection_failed" => ctx.emit(AuditEvent::InspectionFailed {
+                                timestamp: ctx.timestamp(),
+                                pid: event_pid,
+                                syscall: entry
+                                    .nr
+                                    .map(|n| n.to_string())
+                                    .or(entry.syscall)
+                                    .unwrap_or_default(),
                             }),
                             "dropped" => {
                                 if let Some(count) = entry.count {
