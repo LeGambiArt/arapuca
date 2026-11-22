@@ -50,7 +50,7 @@ pub use audit::sanitize_audit_string;
 pub use error::Error;
 pub use profile::{
     CgroupPolicy, Config, GuestFile, ImageSource, Isolation, MicroVmConfig, Profile, ResourceUsage,
-    SeccompProfile,
+    SeccompProfile, UnixSocketConnectPolicy,
 };
 #[cfg(unix)]
 pub use validate::{

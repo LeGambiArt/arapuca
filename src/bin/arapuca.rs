@@ -261,42 +261,71 @@ fn main() {
         // The supervisor reads /proc/<pid>/mem which Landlock
         // excludes, and must be in the host PID namespace.
         #[cfg(seccomp_supported)]
-        let unotify_config = arapuca::env::parse_unotify_config();
+        let unotify_config = match arapuca::env::parse_unotify_config() {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("arapuca: {e}");
+                std::process::exit(125);
+            }
+        };
         #[cfg(seccomp_supported)]
         let unotify_fds = {
             if let Some(ref config) = unotify_config {
-                if arapuca::unotify::unotify_available() {
-                    let unotify_audit_fd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
-                        .ok()
-                        .and_then(|s| s.parse::<i32>().ok())
-                        .unwrap_or(-1);
-                    if unotify_audit_fd >= 0 {
-                        match arapuca::unotify::fork_unotify_supervisor(
-                            config,
-                            unotify_audit_fd,
-                            seccomp_debug,
-                        ) {
-                            Ok(fds) => {
-                                audit_layer(audit_fd, "UnotifySupervisor", true, None);
-                                Some(fds)
-                            }
-                            Err(e) => {
-                                audit_layer(
-                                    audit_fd,
-                                    "UnotifySupervisor",
-                                    false,
-                                    Some(&e.to_string()),
-                                );
-                                eprintln!("arapuca: unotify supervisor: {e}");
-                                None
-                            }
+                // Fail-closed for the UDS connect policy: without a
+                // working supervisor + ADDFD the policy is unenforced.
+                if config.enforce_unix_connect {
+                    if !arapuca::unotify::unotify_available() {
+                        eprintln!(
+                            "arapuca: unix socket connect policy requires seccomp user \
+                             notification support (kernel >= 5.5 and /proc/<pid>/mem \
+                             access; a user namespace via --deny-network or \
+                             --allow-network-listeners, or Yama ptrace_scope=0)"
+                        );
+                        eprintln!(
+                            "arapuca: opt out with --allow-unix-socket-connect (policy \
+                             left unenforced)"
+                        );
+                        std::process::exit(125);
+                    }
+                    if !arapuca::unotify::addfd_available() {
+                        eprintln!(
+                            "arapuca: unix socket connect policy requires \
+                             SECCOMP_IOCTL_NOTIF_ADDFD (kernel >= 5.9)"
+                        );
+                        eprintln!(
+                            "arapuca: opt out with --allow-unix-socket-connect (policy \
+                             left unenforced)"
+                        );
+                        std::process::exit(125);
+                    }
+                }
+                // The audit pipe is optional: policy-only runs pass -1
+                // and the supervisor discards events.
+                let unotify_audit_fd = std::env::var("ARAPUCA_UNOTIFY_AUDIT_FD")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(-1);
+                match arapuca::unotify::fork_unotify_supervisor(
+                    config,
+                    unotify_audit_fd,
+                    seccomp_debug,
+                ) {
+                    Ok(fds) => {
+                        audit_layer(audit_fd, "UnotifySupervisor", true, None);
+                        Some(fds)
+                    }
+                    Err(e) => {
+                        if config.enforce_unix_connect {
+                            eprintln!("arapuca: unotify supervisor: {e}");
+                            eprintln!(
+                                "arapuca: refusing to run without the unix socket \
+                                 connect policy enforced"
+                            );
+                            std::process::exit(125);
                         }
-                    } else {
+                        audit_layer(audit_fd, "UnotifySupervisor", false, Some(&e.to_string()));
                         None
                     }
-                } else {
-                    log::info!("unotify: not available on this kernel");
-                    None
                 }
             } else {
                 None
@@ -440,7 +469,12 @@ fn main() {
                 Ok("baseline") => arapuca::SeccompProfile::Baseline,
                 _ => arapuca::SeccompProfile::Strict,
             };
-            if let Err(e) = arapuca::seccomp::apply(&seccomp_profile, deny_unix_sockets) {
+            let block_dumpable_zero = unotify_config
+                .as_ref()
+                .is_some_and(|c| c.enforce_unix_connect);
+            if let Err(e) =
+                arapuca::seccomp::apply(&seccomp_profile, deny_unix_sockets, block_dumpable_zero)
+            {
                 audit_layer(audit_fd, "Seccomp", false, Some(&e.to_string()));
                 eprintln!("arapuca: seccomp: {e}");
                 std::process::exit(1);
@@ -458,57 +492,96 @@ fn main() {
         // most recently installed filter (required for CONTINUE flag).
         #[cfg(seccomp_supported)]
         if let Some(ref fds) = unotify_fds {
+            let policy_active = unotify_config
+                .as_ref()
+                .is_some_and(|c| c.enforce_unix_connect);
             // Poll readiness first — confirms supervisor is alive.
-            if arapuca::unotify::poll_readiness(fds.readiness_read, 5000).is_ok() {
-                unsafe { libc::close(fds.readiness_read) };
+            match arapuca::unotify::poll_readiness(fds.readiness_read, 5000) {
+                Ok(()) => {
+                    unsafe { libc::close(fds.readiness_read) };
 
-                if let Some(ref config) = unotify_config {
-                    let syscalls = arapuca::unotify::target_syscalls(
-                        config.audit_file_access,
-                        config.audit_network,
-                    );
-                    // The host PID is needed by the supervisor for
-                    // pidfd_open(). In a PID namespace, getpid() returns
-                    // the namespace-local PID (1), so we use the host PID
-                    // piped from fork_into_pidns(). Outside a PID namespace,
-                    // read_host_pid() reads /proc/self/stat — must happen
-                    // BEFORE install_unotify_filter() because the filter
-                    // intercepts openat and would deadlock.
-                    let host_pid = pidns_host_pid.unwrap_or_else(arapuca::unotify::read_host_pid);
-                    match arapuca::unotify::build_unotify_bpf(&syscalls)
-                        .and_then(|bpf| arapuca::unotify::install_unotify_filter(&bpf))
-                    {
-                        Ok(listener_fd) => {
-                            let mut msg = [0u8; 8];
-                            msg[..4].copy_from_slice(&host_pid.to_ne_bytes());
-                            msg[4..].copy_from_slice(&listener_fd.to_ne_bytes());
-                            if !arapuca::unotify::write_all_raw(fds.socketpair_parent, &msg) {
-                                eprintln!(
-                                    "arapuca: send unotify fd: {}",
-                                    std::io::Error::last_os_error()
-                                );
-                                unsafe { libc::_exit(1) };
+                    if let Some(ref config) = unotify_config {
+                        let syscalls = arapuca::unotify::target_syscalls(
+                            config.audit_file_access,
+                            config.audit_network,
+                            config.enforce_unix_connect,
+                        );
+                        // The host PID is needed by the supervisor for
+                        // pidfd_open(). In a PID namespace, getpid() returns
+                        // the namespace-local PID (1), so we use the host PID
+                        // piped from fork_into_pidns(). Outside a PID namespace,
+                        // read_host_pid() reads /proc/self/stat — must happen
+                        // BEFORE install_unotify_filter() because the filter
+                        // intercepts openat and would deadlock.
+                        let host_pid =
+                            pidns_host_pid.unwrap_or_else(arapuca::unotify::read_host_pid);
+                        // Under the UDS connect policy, arch-mismatched
+                        // entries (int 0x80 compat) must die instead of
+                        // bypassing the broker.
+                        let build = if config.enforce_unix_connect {
+                            arapuca::unotify::build_unotify_bpf_kill_arch
+                        } else {
+                            arapuca::unotify::build_unotify_bpf
+                        };
+                        match build(&syscalls)
+                            .and_then(|bpf| arapuca::unotify::install_unotify_filter(&bpf))
+                        {
+                            Ok(listener_fd) => {
+                                let mut msg = [0u8; 8];
+                                msg[..4].copy_from_slice(&host_pid.to_ne_bytes());
+                                msg[4..].copy_from_slice(&listener_fd.to_ne_bytes());
+                                if !arapuca::unotify::write_all_raw(fds.socketpair_parent, &msg) {
+                                    eprintln!(
+                                        "arapuca: send unotify fd: {}",
+                                        std::io::Error::last_os_error()
+                                    );
+                                    unsafe { libc::_exit(1) };
+                                }
+                                // Keep listener_fd open — supervisor duplicates
+                                // it via pidfd_getfd. CLOEXEC ensures it closes
+                                // on exec.
+                                unsafe {
+                                    libc::close(fds.socketpair_parent);
+                                }
                             }
-                            // Keep listener_fd open — supervisor duplicates
-                            // it via pidfd_getfd. CLOEXEC ensures it closes
-                            // on exec.
-                            unsafe {
-                                libc::close(fds.socketpair_parent);
+                            Err(e) => {
+                                if policy_active {
+                                    eprintln!("arapuca: unotify filter: {e}");
+                                    eprintln!(
+                                        "arapuca: refusing to run without the unix \
+                                         socket connect policy enforced"
+                                    );
+                                    unsafe {
+                                        libc::close(fds.socketpair_parent);
+                                        libc::_exit(125);
+                                    }
+                                }
+                                eprintln!("arapuca: unotify filter: {e}");
+                                unsafe { libc::close(fds.socketpair_parent) };
                             }
                         }
-                        Err(e) => {
-                            eprintln!("arapuca: unotify filter: {e}");
-                            unsafe { libc::close(fds.socketpair_parent) };
+                    } else {
+                        unsafe { libc::close(fds.socketpair_parent) };
+                    }
+                }
+                Err(e) => {
+                    if policy_active {
+                        eprintln!("arapuca: unotify supervisor: {e}");
+                        eprintln!(
+                            "arapuca: refusing to run without the unix socket \
+                             connect policy enforced"
+                        );
+                        unsafe {
+                            libc::close(fds.readiness_read);
+                            libc::close(fds.socketpair_parent);
+                            libc::_exit(125);
                         }
                     }
-                } else {
-                    unsafe { libc::close(fds.socketpair_parent) };
-                }
-            } else {
-                eprintln!("arapuca: unotify supervisor readiness timeout");
-                unsafe {
-                    libc::close(fds.readiness_read);
-                    libc::close(fds.socketpair_parent);
+                    eprintln!("arapuca: unotify supervisor: {e}");
+                    unsafe {
+                        libc::close(fds.readiness_read);
+                        libc::close(fds.socketpair_parent);
+                    }
                 }
             }
         }
@@ -635,6 +708,8 @@ fn run_subcommand(args: &[String]) {
     let mut cwd: Option<PathBuf> = None;
     let mut seccomp_profile = arapuca::SeccompProfile::Strict;
     let mut deny_unix_sockets = false;
+    let mut unix_socket_connect_policy = arapuca::UnixSocketConnectPolicy::AllowAll;
+    let mut unix_socket_deny_roots: Vec<PathBuf> = Vec::new();
     #[cfg(unix)]
     let mut tty = false;
     #[cfg(target_os = "linux")]
@@ -684,6 +759,22 @@ fn run_subcommand(args: &[String]) {
             eprintln!("                     SSL_CERT_FILE/CURL_CA_BUNDLE are not forwarded)");
             eprintln!("  --seccomp MODE     seccomp profile: strict (default) or baseline");
             eprintln!("  --no-unix-sockets  deny Unix sockets (Linux x86_64/aarch64 only)");
+            eprintln!(
+                "  --deny-privileged-unix-sockets  deny connect() to privileged daemon \
+                 sockets"
+            );
+            eprintln!(
+                "                     (docker, podman system, dbus, libvirt, ...; \
+                 Linux only)"
+            );
+            eprintln!(
+                "  --unix-socket-deny-root PATH   add a deny root for the unix \
+                 socket policy"
+            );
+            eprintln!(
+                "  --allow-unix-socket-connect    disable the unix socket connect \
+                 policy"
+            );
             eprintln!("  --no-pid-ns        disable PID namespace isolation");
             eprintln!("  --lpac             run as a Less Privileged AppContainer (Windows only);");
             eprintln!(
@@ -888,6 +979,25 @@ fn run_subcommand(args: &[String]) {
             "--no-unix-sockets" => {
                 deny_unix_sockets = true;
             }
+            "--deny-privileged-unix-sockets" => {
+                unix_socket_connect_policy = arapuca::UnixSocketConnectPolicy::DenyPrivileged;
+            }
+            "--allow-unix-socket-connect" => {
+                unix_socket_connect_policy = arapuca::UnixSocketConnectPolicy::AllowAll;
+            }
+            "--unix-socket-deny-root" => {
+                i += 1;
+                let root = flag_args.get(i).unwrap_or_else(|| {
+                    eprintln!("arapuca run: --unix-socket-deny-root requires a path");
+                    std::process::exit(125);
+                });
+                let path = PathBuf::from(root);
+                if !path.is_absolute() {
+                    eprintln!("arapuca run: --unix-socket-deny-root must be absolute: {root}");
+                    std::process::exit(125);
+                }
+                unix_socket_deny_roots.push(path);
+            }
             "--lpac" => {
                 lpac = true;
                 #[cfg(not(windows))]
@@ -1054,6 +1164,8 @@ fn run_subcommand(args: &[String]) {
         lpac,
         seccomp_profile,
         deny_unix_sockets,
+        unix_socket_connect_policy,
+        unix_socket_deny_roots,
         audit_file_access: audit_files,
         audit_network: audit_network || deny_network,
         seccomp_debug,
@@ -1062,6 +1174,10 @@ fn run_subcommand(args: &[String]) {
         allow_network_listeners,
         ..Default::default()
     };
+    if let Err(e) = profile.validate_unix_socket_policy() {
+        eprintln!("arapuca run: {e}");
+        std::process::exit(125);
+    }
 
     // ── TTY mode validation ────────────────────────────────────
     #[cfg(unix)]

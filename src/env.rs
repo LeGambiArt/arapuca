@@ -427,10 +427,18 @@ pub fn bridge_env(
 
 /// Build the `ARAPUCA_UNOTIFY_CONFIG` env var for the wrapper binary.
 ///
-/// Encodes which unotify audit features are enabled and the bridge port
-/// for network enforcement. Format: comma-separated flags.
+/// Encodes which unotify features are enabled (audit flags, bridge
+/// port for network enforcement, UDS connect policy + deny roots).
+/// Format: comma-separated flags; deny roots are colon-separated
+/// within their part. Roots are validated at profile level to
+/// contain neither separator.
 pub fn unotify_env(profile: &crate::Profile) -> Option<(String, String)> {
-    if !profile.audit_file_access && !profile.audit_network {
+    #[cfg(not(seccomp_supported))]
+    let policy_active = false;
+    #[cfg(seccomp_supported)]
+    let policy_active =
+        profile.unix_socket_connect_policy == crate::UnixSocketConnectPolicy::DenyPrivileged;
+    if !profile.audit_file_access && !profile.audit_network && !policy_active {
         return None;
     }
     let mut parts = Vec::new();
@@ -447,47 +455,112 @@ pub fn unotify_env(profile: &crate::Profile) -> Option<(String, String)> {
     if profile.dns_capture && profile.use_netns {
         parts.push("dns_port=53".to_string());
     }
+    if policy_active {
+        parts.push("uds".to_string());
+        // Merged root list: built-ins plus operator additions. Both
+        // the literal and the canonicalized form of each operator
+        // root are pushed: the broker compares the peer against the
+        // listener's bind-time path, which getpeername returns
+        // exactly as the daemon wrote it — never resolved. A daemon
+        // that bound through a symlinked directory answers with that
+        // literal, so a root stored only in canonical form never
+        // matches it. Nonexistent roots stay literal only.
+        //
+        // The separator validation in the profile checked the typed
+        // path; a symlink target can itself contain ':' or ',', and
+        // such a resolved form cannot be encoded — it is skipped, not
+        // pushed (see below), never allowed to corrupt the record.
+        #[cfg(seccomp_supported)]
+        {
+            let mut roots = crate::unotify::builtin_unix_deny_roots();
+            for root in &profile.unix_socket_deny_roots {
+                let literal = root.to_string_lossy().into_owned();
+                roots.push(literal.clone());
+                if let Ok(canonical) = std::fs::canonicalize(root) {
+                    let canonical = canonical.to_string_lossy().into_owned();
+                    // A resolved form containing a separator cannot be
+                    // encoded without corrupting the config record.
+                    // Dropping the whole config would run the policy
+                    // unenforced, so the canonical form is skipped
+                    // instead: the literal (already validated
+                    // separator-free) still denies the bind-time path
+                    // the daemon most likely echoes.
+                    if canonical != literal && !canonical.contains(':') && !canonical.contains(',')
+                    {
+                        roots.push(canonical);
+                    }
+                }
+            }
+            parts.push(format!("uds_deny_roots={}", roots.join(":")));
+        }
+    }
     Some(("ARAPUCA_UNOTIFY_CONFIG".into(), parts.join(",")))
 }
 
 /// Parse the `ARAPUCA_UNOTIFY_CONFIG` env var in the wrapper binary.
+///
+/// The UDS policy tokens are parsed strictly: a malformed or unknown
+/// `uds*` part is an error (never a silent downgrade to a less
+/// restrictive policy).
 #[cfg(seccomp_supported)]
-pub fn parse_unotify_config() -> Option<crate::unotify::UnotifyConfig> {
-    let val = std::env::var("ARAPUCA_UNOTIFY_CONFIG").ok()?;
+pub fn parse_unotify_config() -> Result<Option<crate::unotify::UnotifyConfig>, String> {
+    let Some(val) = std::env::var("ARAPUCA_UNOTIFY_CONFIG").ok() else {
+        return Ok(None);
+    };
     let mut audit_file_access = false;
     let mut audit_network = false;
     let mut bridge_port = None;
     let mut dns_port = None;
     let mut enforce_network = false;
+    let mut enforce_unix_connect = false;
+    let mut unix_deny_roots = Vec::new();
 
     for part in val.split(',') {
         match part {
             "file" => audit_file_access = true,
             "network" => audit_network = true,
             "enforce" => enforce_network = true,
+            "uds" => enforce_unix_connect = true,
             s if s.starts_with("bridge_port=") => {
                 bridge_port = s.strip_prefix("bridge_port=").and_then(|p| p.parse().ok());
             }
             s if s.starts_with("dns_port=") => {
                 dns_port = s.strip_prefix("dns_port=").and_then(|p| p.parse().ok());
             }
+            s if s.starts_with("uds_deny_roots=") => {
+                let roots = s.strip_prefix("uds_deny_roots=").unwrap_or_default();
+                if roots.is_empty() {
+                    return Err("malformed ARAPUCA_UNOTIFY_CONFIG: empty uds_deny_roots".into());
+                }
+                for root in roots.split(':') {
+                    if root.is_empty() {
+                        return Err("malformed ARAPUCA_UNOTIFY_CONFIG: empty deny root".into());
+                    }
+                    unix_deny_roots.push(root.to_string());
+                }
+            }
+            s if s.starts_with("uds") => {
+                return Err(format!(
+                    "malformed ARAPUCA_UNOTIFY_CONFIG: unknown uds part: {s}"
+                ));
+            }
             _ => {}
         }
     }
 
-    if !audit_file_access && !audit_network {
-        return None;
+    if !audit_file_access && !audit_network && !enforce_unix_connect {
+        return Ok(None);
     }
 
-    Some(crate::unotify::UnotifyConfig {
+    Ok(Some(crate::unotify::UnotifyConfig {
         audit_file_access,
         audit_network,
         bridge_port,
         dns_port,
         enforce_network,
-        enforce_unix_connect: false,
-        unix_deny_roots: Vec::new(),
-    })
+        enforce_unix_connect,
+        unix_deny_roots,
+    }))
 }
 
 /// Per-platform default read and write paths for `arapuca run`.

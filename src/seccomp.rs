@@ -278,15 +278,19 @@ pub(crate) fn validate_single_threaded() -> crate::Result<()> {
 /// Returns an error if filter construction or installation fails.
 /// This is fail-closed — an error means the process is NOT filtered.
 #[must_use = "seccomp errors must be handled — the process may be unfiltered"]
-pub fn apply(profile: &crate::SeccompProfile, deny_unix_sockets: bool) -> crate::Result<()> {
+pub fn apply(
+    profile: &crate::SeccompProfile,
+    deny_unix_sockets: bool,
+    block_dumpable_zero: bool,
+) -> crate::Result<()> {
     match profile {
         crate::SeccompProfile::Strict => {
-            let filter = build_filter(deny_unix_sockets)?;
+            let filter = build_filter(deny_unix_sockets, block_dumpable_zero)?;
             seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
             log::info!("seccomp: strict filter applied");
         }
         crate::SeccompProfile::Baseline => {
-            let filter = build_baseline_filter(deny_unix_sockets)?;
+            let filter = build_baseline_filter(deny_unix_sockets, block_dumpable_zero)?;
             seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
             log::info!("seccomp: baseline filter applied");
         }
@@ -327,7 +331,7 @@ fn add_unix_socket_rules(rules: &mut HashMap<i64, Vec<SeccompRule>>) -> crate::R
 /// The filter uses a default-allow policy with explicit deny rules.
 /// This matches the Go implementation's approach: block dangerous
 /// syscalls, allow everything else.
-fn build_filter(deny_unix_sockets: bool) -> crate::Result<BpfProgram> {
+fn build_filter(deny_unix_sockets: bool, block_dumpable_zero: bool) -> crate::Result<BpfProgram> {
     let arch = target_arch()?;
 
     // Collect all rules: syscall -> (action, conditions).
@@ -432,10 +436,27 @@ fn build_filter(deny_unix_sockets: bool) -> crate::Result<BpfProgram> {
     ])
     .map_err(|e| Error::Seccomp(format!("prctl rule: {e}")))?;
 
-    eperm_rules.insert(
-        libc::SYS_prctl,
-        vec![prctl_block_pdeathsig, prctl_set_dumpable],
-    );
+    // Under the UDS connect policy, PR_SET_DUMPABLE(0) is blocked as
+    // defense-in-depth: it defeats the supervisor's /proc/<pid>/mem
+    // inspection (the connect broker's fail-closed matrix remains the
+    // primary control — this stops the attempt earlier).
+    let mut prctl_rules = vec![prctl_block_pdeathsig, prctl_set_dumpable];
+    if block_dumpable_zero {
+        let prctl_dumpable_zero = SeccompRule::new(vec![
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::PR_SET_DUMPABLE as u64,
+            )
+            .map_err(|e| Error::Seccomp(format!("prctl condition: {e}")))?,
+            SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0u64)
+                .map_err(|e| Error::Seccomp(format!("prctl arg condition: {e}")))?,
+        ])
+        .map_err(|e| Error::Seccomp(format!("prctl rule: {e}")))?;
+        prctl_rules.push(prctl_dumpable_zero);
+    }
+    eperm_rules.insert(libc::SYS_prctl, prctl_rules);
 
     // Block execveat with AT_EMPTY_PATH (fileless execution).
     // execveat(fd, "", ..., flags) — flags is arg4.
@@ -782,7 +803,10 @@ fn baseline_kill_syscalls() -> Vec<i64> {
 /// Blocks escape-critical syscalls unconditionally, plus clone() with
 /// namespace flags and clone3 (returns ENOSYS to force fallback to
 /// clone where flags can be inspected).
-fn build_baseline_filter(deny_unix_sockets: bool) -> crate::Result<BpfProgram> {
+fn build_baseline_filter(
+    deny_unix_sockets: bool,
+    block_dumpable_zero: bool,
+) -> crate::Result<BpfProgram> {
     let arch = target_arch()?;
 
     let mut deny: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
@@ -932,10 +956,25 @@ fn build_baseline_filter(deny_unix_sockets: bool) -> crate::Result<BpfProgram> {
             .map_err(|e| Error::Seccomp(format!("baseline prctl arg condition: {e}")))?,
     ])
     .map_err(|e| Error::Seccomp(format!("baseline prctl rule: {e}")))?;
-    eperm_rules.insert(
-        libc::SYS_prctl,
-        vec![baseline_prctl_pdeathsig, baseline_prctl_dumpable],
-    );
+    // Under the UDS connect policy, PR_SET_DUMPABLE(0) is blocked as
+    // defense-in-depth (see build_filter).
+    let mut baseline_prctl_rules = vec![baseline_prctl_pdeathsig, baseline_prctl_dumpable];
+    if block_dumpable_zero {
+        let baseline_prctl_dumpable_zero = SeccompRule::new(vec![
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::PR_SET_DUMPABLE as u64,
+            )
+            .map_err(|e| Error::Seccomp(format!("baseline prctl condition: {e}")))?,
+            SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0u64)
+                .map_err(|e| Error::Seccomp(format!("baseline prctl arg condition: {e}")))?,
+        ])
+        .map_err(|e| Error::Seccomp(format!("baseline prctl rule: {e}")))?;
+        baseline_prctl_rules.push(baseline_prctl_dumpable_zero);
+    }
+    eperm_rules.insert(libc::SYS_prctl, baseline_prctl_rules);
 
     // execveat with AT_EMPTY_PATH (fileless execution)
     eperm_rules.insert(
@@ -1447,7 +1486,7 @@ mod tests {
         // Verify the filter compiles without error.
         // We don't apply it here because that would restrict this test process.
         let (exited, code) = run_in_clean_child(|| {
-            if build_filter(false).is_ok() {
+            if build_filter(false, false).is_ok() {
                 unsafe { libc::_exit(42) };
             }
         });
@@ -1464,7 +1503,7 @@ mod tests {
 
         if pid == 0 {
             // Child: apply filter and run the test.
-            if let Err(e) = apply(&crate::SeccompProfile::Strict, false) {
+            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, false) {
                 eprintln!("seccomp apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -1915,6 +1954,36 @@ mod tests {
     }
 
     #[test]
+    fn prctl_set_dumpable_zero_blocked_under_uds_policy() {
+        // Defense-in-depth for the unotify connect broker: without
+        // this rule, PR_SET_DUMPABLE(0) defeats the supervisor's
+        // /proc/pid/mem inspection.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, true) {
+                eprintln!("seccomp apply failed: {e}");
+                unsafe { libc::_exit(99) };
+            }
+            let ret = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+            if ret != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+                unsafe { libc::_exit(42) };
+            }
+            unsafe { libc::_exit(1) };
+        }
+        let mut wstatus: libc::c_int = 0;
+        // SAFETY: pid is valid from fork.
+        let ret = unsafe { libc::waitpid(pid, &mut wstatus, 0) };
+        assert!(ret > 0, "waitpid failed");
+        assert!(libc::WIFEXITED(wstatus), "child should exit normally");
+        assert_eq!(
+            libc::WEXITSTATUS(wstatus),
+            42,
+            "PR_SET_DUMPABLE=0 should return EPERM under the UDS policy"
+        );
+    }
+
+    #[test]
     fn tier2_socket_inet6_eperm() {
         let (exited, code) = run_in_filtered_child(|| {
             let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
@@ -1935,7 +2004,7 @@ mod tests {
         assert!(pid >= 0, "fork failed");
 
         if pid == 0 {
-            if let Err(e) = apply(&crate::SeccompProfile::Baseline, false) {
+            if let Err(e) = apply(&crate::SeccompProfile::Baseline, false, false) {
                 eprintln!("seccomp baseline apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -2192,7 +2261,7 @@ mod tests {
         ] {
             for deny in [false, true] {
                 let (exited, code) = run_in_clean_child(|| {
-                    if apply(&profile, deny).is_err() {
+                    if apply(&profile, deny, false).is_err() {
                         unsafe { libc::_exit(99) };
                     }
                     for ty in [libc::SOCK_STREAM, libc::SOCK_DGRAM] {

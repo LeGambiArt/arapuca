@@ -113,17 +113,20 @@ impl Sandbox for Linux {
         // and filesystem paths are configured, wrap through it.
         let wrapper = Self::wrapper_path();
         let use_wrapper = wrapper.is_some();
-        let pinned_wrapper =
-            if cfg.profile.deny_unix_sockets && !crate::selfexec::selfexec_enabled() {
-                let path = wrapper.as_ref().ok_or_else(|| {
-                    Error::Validation("Unix socket denial requires a wrapper".into())
-                })?;
-                let pinned = super::wrapper_exec::PinnedWrapper::open(path)?;
-                pinned.check()?;
-                Some(pinned)
-            } else {
-                None
-            };
+        let uds_policy_active = cfg.profile.unix_socket_connect_policy
+            == crate::profile::UnixSocketConnectPolicy::DenyPrivileged;
+        let pinned_wrapper = if (cfg.profile.deny_unix_sockets || uds_policy_active)
+            && !crate::selfexec::selfexec_enabled()
+        {
+            let path = wrapper.as_ref().ok_or_else(|| {
+                Error::Validation("Unix socket denial / connect policy requires a wrapper".into())
+            })?;
+            let pinned = super::wrapper_exec::PinnedWrapper::open(path)?;
+            pinned.check()?;
+            Some(pinned)
+        } else {
+            None
+        };
 
         if use_wrapper {
             let wrapper_path = wrapper.as_ref().unwrap();
@@ -645,45 +648,72 @@ impl Sandbox for Linux {
             }
         }
 
-        // ── Unotify audit pipe ─────────────────────────────────────
-        // When file access or network auditing is enabled, create a
-        // pipe for the unotify supervisor to write NDJSON audit lines.
-        let unotify_wants = (cfg.profile.audit_file_access || cfg.profile.audit_network)
+        // ── Unotify audit pipe + supervisor config ────────────────
+        // Audit features need a pipe for the supervisor's NDJSON
+        // lines (and the serde feature to parse them). The UDS
+        // connect policy needs neither — it must reach the wrapper
+        // whenever it is active, independent of the audit sink and
+        // the serde feature (enforcement decoupled from audit).
+        let audit_wants = (cfg.profile.audit_file_access || cfg.profile.audit_network)
             && use_wrapper
             && cfg!(feature = "serde");
-        let unotify_audit_pipe = if unotify_wants {
-            let mut fds = [0i32; 2];
-            let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-            if ret == 0 {
-                let target_fd = 3 + fds_to_inherit.len() as i32;
-                fds_to_inherit.push(fds[1]);
-                command.env("ARAPUCA_UNOTIFY_AUDIT_FD", target_fd.to_string());
-                pipe_guard.push(fds[0]);
-                pipe_guard.push(fds[1]);
-                // Also set the config env var.
-                if let Some(kv) = crate::env::unotify_env(&cfg.profile) {
-                    command.env(&kv.0, &kv.1);
+        let unotify_wants = audit_wants || (uds_policy_active && use_wrapper);
+        let mut unotify_audit_pipe = None;
+        if unotify_wants {
+            let config_env = crate::env::unotify_env(&cfg.profile);
+            if audit_wants {
+                let mut fds = [0i32; 2];
+                let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+                if ret == 0 {
+                    let target_fd = 3 + fds_to_inherit.len() as i32;
+                    fds_to_inherit.push(fds[1]);
+                    command.env("ARAPUCA_UNOTIFY_AUDIT_FD", target_fd.to_string());
+                    pipe_guard.push(fds[0]);
+                    pipe_guard.push(fds[1]);
+                    if let Some(kv) = &config_env {
+                        command.env(&kv.0, &kv.1);
+                    }
+                    unotify_audit_pipe = Some((fds[0], fds[1]));
+                } else if uds_policy_active {
+                    // Fail-closed: without the pipe the wrapper never
+                    // forks the supervisor and the policy would be
+                    // silently unenforced.
+                    return Err(Error::Process(
+                        "unotify audit pipe creation failed while the \
+                         unix socket connect policy is active"
+                            .into(),
+                    ));
+                } else {
+                    log::warn!("unotify audit pipe creation failed, continuing without");
                 }
-                Some((fds[0], fds[1]))
-            } else {
-                log::warn!("unotify audit pipe creation failed, continuing without");
-                None
+            } else if let Some(kv) = &config_env {
+                // Policy-only: no audit pipe; the supervisor discards
+                // events (audit fd -1).
+                command.env(&kv.0, &kv.1);
             }
-        } else {
-            None
-        };
+        }
 
         if let Some(ref ctx) = audit_ctx {
-            if unotify_audit_pipe.is_some() {
+            if unotify_wants {
                 ctx.emit(AuditEvent::LayerApplied {
                     timestamp: ctx.timestamp(),
                     layer: SandboxLayer::UnotifySupervisor,
-                    detail: None,
+                    detail: if uds_policy_active {
+                        Some(LayerDetail::Other("connect broker (UDS policy)".into()))
+                    } else {
+                        None
+                    },
                 })?;
                 applied_layers.push(SandboxLayer::UnotifySupervisor);
             } else {
-                let reason = if !cfg.profile.audit_file_access && !cfg.profile.audit_network {
+                let reason = if !cfg.profile.audit_file_access
+                    && !cfg.profile.audit_network
+                    && !uds_policy_active
+                {
                     SkipReason::NotConfigured
+                } else if uds_policy_active && !use_wrapper {
+                    // Unreachable: validation above already failed.
+                    SkipReason::ComponentMissing("wrapper binary not available".into())
                 } else if !cfg!(feature = "serde") {
                     SkipReason::ComponentMissing(
                         "serde feature required for unotify audit parsing".into(),
