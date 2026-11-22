@@ -6,11 +6,10 @@ use std::process::Command;
 use std::time::Duration;
 
 fn arapuca_bin() -> std::path::PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // test binary
-    path.pop(); // deps
-    path.push("arapuca");
-    path
+    // Compile-time location of the binary built by this package:
+    // robust to cargo's test-binary layout (deps/ vs build/out/),
+    // which differs across cargo versions.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_arapuca"))
 }
 
 #[test]
