@@ -399,6 +399,15 @@ pub fn wrapper_env(profile: &crate::Profile) -> crate::Result<Vec<(String, Strin
         "ARAPUCA_SCOPE_SIGNALS".into(),
         if scope_signals { "1" } else { "0" }.into(),
     ));
+    env.push((
+        "ARAPUCA_DENY_FS_METADATA".into(),
+        if profile.effective_deny_fs_metadata() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    ));
     if profile.allow_network_listeners {
         env.push(("ARAPUCA_ALLOW_NETWORK_LISTENERS".into(), "1".into()));
     }

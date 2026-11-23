@@ -666,6 +666,17 @@ void arapuca_profile_set_deny_unix_sockets(struct arapuca_ArapucaProfile *profil
 void arapuca_profile_set_no_pid_ns(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
+ * Deny filesystem-metadata mutation (chmod/chown/xattr/truncate
+ * class, including chattr ioctls) with seccomp EPERM. Calling this overrides the
+ * derived default (on with the Strict seccomp profile); not
+ * calling it keeps the default.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_deny_fs_metadata(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
  * Set Landlock signal scoping explicitly (Linux, kernel ABI 6+):
  * the sandboxed process cannot send signals to processes outside
  * its Landlock domain. Calling this overrides the derived default

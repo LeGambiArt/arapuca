@@ -520,9 +520,13 @@ fn main() {
             // skip, no record), and the policy case additionally
             // turns it into an EACCES.
             let block_dumpable_zero = unotify_config.is_some();
-            if let Err(e) =
-                arapuca::seccomp::apply(&seccomp_profile, deny_unix_sockets, block_dumpable_zero)
-            {
+            let deny_fs_metadata = std::env::var("ARAPUCA_DENY_FS_METADATA").as_deref() == Ok("1");
+            if let Err(e) = arapuca::seccomp::apply(
+                &seccomp_profile,
+                deny_unix_sockets,
+                block_dumpable_zero,
+                deny_fs_metadata,
+            ) {
                 audit_layer(audit_fd, "Seccomp", false, Some(&e.to_string()));
                 eprintln!("arapuca: seccomp: {e}");
                 std::process::exit(1);

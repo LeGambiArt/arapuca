@@ -208,6 +208,22 @@ pub struct Profile {
     /// below ABI 6 the scope is skipped with an audit event, never a
     /// failed run.
     pub scope_signals: Option<bool>,
+    /// Deny filesystem-metadata mutation (chmod/chown/xattr/
+    /// truncate class, including chattr ioctls) with seccomp EPERM.
+    /// Landlock cannot restrict these on paths it otherwise grants,
+    /// so without this tier a sandboxed process can `chmod 000
+    /// ~/.ssh` or plant world-writable files on multi-user hosts.
+    /// Every variant is denied, path-based and fd-based alike
+    /// (`fchmod` works on `O_RDONLY` descriptors); only `ftruncate`
+    /// survives, gated by Landlock write rights, and so does the
+    /// timestamp family — GNU touch always utimensats after creating
+    /// a file, and denying it breaks every build script that touches
+    /// files. Creation modes (umask, O_CREAT) are likewise not
+    /// covered.
+    ///
+    /// `None` (the default) derives from the seccomp profile: on
+    /// with Strict, off with Baseline. `Some(v)` is explicit.
+    pub deny_fs_metadata: Option<bool>,
     /// Selective Unix-socket connect policy (Linux process isolation
     /// only).
     ///
@@ -329,6 +345,13 @@ impl Profile {
     /// profile always reads as Strict.
     pub fn effective_scope_signals(&self) -> bool {
         self.scope_signals
+            .unwrap_or(self.seccomp_profile == SeccompProfile::Strict)
+    }
+
+    /// Effective metadata-denial request, same derivation rule as
+    /// [`Profile::effective_scope_signals`].
+    pub fn effective_deny_fs_metadata(&self) -> bool {
+        self.deny_fs_metadata
             .unwrap_or(self.seccomp_profile == SeccompProfile::Strict)
     }
 
