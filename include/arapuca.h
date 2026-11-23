@@ -655,6 +655,19 @@ void arapuca_process_cleanup(struct arapuca_ArapucaProcess *proc);
 void arapuca_profile_set_deny_unix_sockets(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
+ * Set Landlock signal scoping explicitly (Linux, kernel ABI 6+):
+ * the sandboxed process cannot send signals to processes outside
+ * its Landlock domain. Calling this overrides the derived default
+ * (on with the Strict seccomp profile); not calling it keeps the
+ * default. Kernels below ABI 6 skip the scope with an audit event.
+ * No effect on non-Linux platforms.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_scope_signals(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
  * Deny connects to the same-user session sockets: the session bus
  * (XDG_RUNTIME_DIR/bus) and `systemd --user` private socket. Without
  * this, a sandboxed process can start user units that run outside

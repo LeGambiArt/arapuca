@@ -361,7 +361,10 @@ fn main() {
         };
 
         let target = std::path::Path::new(&cmd);
-        if let Err(e) = arapuca::landlock::apply(&profile, Some(target)) {
+        // Derived and ABI-gated launcher-side; the env var carries
+        // the effective bool.
+        let scope_signals = std::env::var("ARAPUCA_SCOPE_SIGNALS").as_deref() == Ok("1");
+        if let Err(e) = arapuca::landlock::apply(&profile, Some(target), scope_signals) {
             audit_layer(audit_fd, "Landlock", false, Some(&e.to_string()));
             eprintln!("arapuca: landlock: {e}");
             std::process::exit(1);
@@ -2215,7 +2218,9 @@ fn fork_connect_proxy(
                     read_paths: proxy_read_paths,
                     ..Default::default()
                 };
-                if let Err(e) = arapuca::landlock::apply(&proxy_profile, None) {
+                if let Err(e) = arapuca::landlock::apply(&proxy_profile, None, false) {
+                    // No signal scoping for the proxy child: it is a
+                    // trusted helper, and scoping it buys nothing.
                     eprintln!("arapuca: connect proxy: landlock: {e}");
                     unsafe { libc::_exit(1) };
                 }

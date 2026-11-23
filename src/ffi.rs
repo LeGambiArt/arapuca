@@ -1246,6 +1246,27 @@ pub unsafe extern "C" fn arapuca_profile_set_deny_unix_sockets(
     }
 }
 
+/// Set Landlock signal scoping explicitly (Linux, kernel ABI 6+):
+/// the sandboxed process cannot send signals to processes outside
+/// its Landlock domain. Calling this overrides the derived default
+/// (on with the Strict seccomp profile); not calling it keeps the
+/// default. Kernels below ABI 6 skip the scope with an audit event.
+/// No effect on non-Linux platforms.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_scope_signals(
+    profile: *mut ArapucaProfile,
+    enabled: bool,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.scope_signals = Some(enabled);
+        }
+    }
+}
+
 /// Deny connects to the same-user session sockets: the session bus
 /// (XDG_RUNTIME_DIR/bus) and `systemd --user` private socket. Without
 /// this, a sandboxed process can start user units that run outside
@@ -1416,7 +1437,13 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
         }
     }
     #[cfg(target_os = "linux")]
-    if let Err(e) = crate::landlock::apply(inner, None) {
+    // Same derivation and ABI gate as the wrapper env: a requested
+    // scope on a pre-6.12 kernel is skipped, not failed, matching
+    // the launch path's loud-skip semantics.
+    let scope_signals =
+        inner.effective_scope_signals() && crate::landlock::signal_scope_supported();
+    #[cfg(target_os = "linux")]
+    if let Err(e) = crate::landlock::apply(inner, None, scope_signals) {
         set_error(&format!("landlock: {e}"));
         return -1;
     }
@@ -2022,5 +2049,24 @@ mod tests {
         let cs = CString::new(long).unwrap();
         let result = unsafe { validate_cstr(cs.as_ptr()) };
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod scope_signals_ffi_tests {
+    use super::*;
+
+    #[test]
+    fn profile_set_scope_signals_overrides_derivation() {
+        let p = arapuca_profile_new();
+        assert!(!p.is_null());
+        unsafe {
+            let inner = (*p).inner.as_ref().unwrap();
+            assert!(inner.effective_scope_signals(), "Strict default on");
+            arapuca_profile_set_scope_signals(p, false);
+            assert_eq!((*p).inner.as_ref().unwrap().scope_signals, Some(false));
+            assert!(!(*p).inner.as_ref().unwrap().effective_scope_signals());
+            arapuca_profile_free(p);
+        }
     }
 }

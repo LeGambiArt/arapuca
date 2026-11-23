@@ -216,6 +216,31 @@ impl Sandbox for Linux {
                 }
                 applied_layers.push(layer);
             }
+            // Signal scoping: requested via the profile (Strict locks
+            // it on by default); skipped loudly — never a failed run —
+            // on kernels whose Landlock ABI predates Scope::Signal.
+            if cfg.profile.effective_scope_signals() {
+                if crate::landlock::signal_scope_supported() {
+                    if let Some(ref ctx) = audit_ctx {
+                        ctx.emit(AuditEvent::LayerApplied {
+                            timestamp: ctx.timestamp(),
+                            layer: SandboxLayer::SignalScope,
+                            detail: None,
+                        })?;
+                    }
+                    applied_layers.push(SandboxLayer::SignalScope);
+                } else {
+                    log::warn!("landlock: signal scope requested but kernel ABI < 6; skipping");
+                    if let Some(ref ctx) = audit_ctx {
+                        ctx.emit(AuditEvent::LayerSkipped {
+                            timestamp: ctx.timestamp(),
+                            layer: SandboxLayer::SignalScope,
+                            reason: SkipReason::KernelUnsupported,
+                        })?;
+                    }
+                    skipped_layers.push(SandboxLayer::SignalScope);
+                }
+            }
             #[cfg(seccomp_supported)]
             {
                 if let Some(ref ctx) = audit_ctx {

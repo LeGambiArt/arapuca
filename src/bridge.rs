@@ -1894,7 +1894,9 @@ pub fn fork_connect_proxy(
                     read_paths: proxy_read_paths,
                     ..Default::default()
                 };
-                if let Err(e) = crate::landlock::apply(&proxy_profile, None) {
+                if let Err(e) = crate::landlock::apply(&proxy_profile, None, false) {
+                    // No signal scoping for the proxy child: it is a
+                    // trusted helper, and scoping it buys nothing.
                     eprintln!("arapuca: connect proxy: landlock: {e}");
                     unsafe { libc::_exit(1) };
                 }

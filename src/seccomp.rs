@@ -2469,7 +2469,7 @@ mod tests {
     #[test]
     fn unavailable_proc_enumeration_fails_closed() {
         let (exited, code) = run_in_clean_child(|| {
-            if crate::landlock::apply(&crate::Profile::default(), None).is_err() {
+            if crate::landlock::apply(&crate::Profile::default(), None, false).is_err() {
                 unsafe { libc::_exit(99) };
             }
             match validate_no_retained_unix_resources() {

@@ -294,7 +294,10 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         }
 
         let target = std::path::Path::new(&cmd);
-        if let Err(e) = crate::landlock::apply(&profile, Some(target)) {
+        // Derived and ABI-gated launcher-side; the env var carries
+        // the effective bool.
+        let scope_signals = std::env::var("ARAPUCA_SCOPE_SIGNALS").as_deref() == Ok("1");
+        if let Err(e) = crate::landlock::apply(&profile, Some(target), scope_signals) {
             audit_layer(audit_fd, "Landlock", false, Some(&e.to_string()));
             write_stderr(&format!("arapuca: selfexec: landlock: {e}\n"));
             unsafe { libc::_exit(1) };
