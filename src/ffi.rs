@@ -931,16 +931,20 @@ impl crate::audit::AuditSink for FfiAuditSink {
 /// sandbox lifecycle. See `ArapucaAuditCallback` for the safety
 /// contract.
 ///
+/// A NULL `cb` is rejected with an error — there is no "clear the
+/// callback" path; build a fresh config instead.
+///
 /// Returns 0 on success, -1 on error.
 ///
 /// # Safety
-/// `cfg` must be a valid pointer. `cb` must be a valid function pointer.
-/// `user_data` must remain valid until `arapuca_process_cleanup()`.
+/// `cfg` must be a valid pointer. `cb` must be a valid function
+/// pointer or NULL (NULL is rejected, not called). `user_data` must
+/// remain valid until `arapuca_process_cleanup()`.
 #[cfg(feature = "serde")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arapuca_config_set_audit_callback(
     cfg: *mut ArapucaConfig,
-    cb: Option<ArapucaAuditCallback>,
+    cb: ArapucaAuditCallback,
     user_data: *mut std::ffi::c_void,
 ) -> i32 {
     clear_error();
@@ -952,10 +956,15 @@ pub unsafe extern "C" fn arapuca_config_set_audit_callback(
         set_error("config already freed");
         return -1;
     };
-    let Some(cb) = cb else {
+    // A plain function pointer in the ABI instead of Option<fn>:
+    // cbindgen cannot express Rust's niche optimization, so an
+    // Option<fn> parameter becomes an opaque struct in the header
+    // that no C consumer can construct. Casting to usize only
+    // compares the pointer; a null fn pointer is never called.
+    if cb as usize == 0 {
         set_error("null callback pointer");
         return -1;
-    };
+    }
     let sink = FfiAuditSink {
         callback: cb,
         user_data,
@@ -1918,6 +1927,32 @@ mod tests {
         let cfg = arapuca_config_new();
         assert!(!cfg.is_null());
         unsafe { arapuca_config_free(cfg) };
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn audit_callback_null_rejected_and_fn_accepted() {
+        let cfg = arapuca_config_new();
+        assert!(!cfg.is_null());
+        unsafe extern "C" fn sink(
+            _json: *const c_char,
+            _len: usize,
+            _user_data: *mut std::ffi::c_void,
+        ) {
+        }
+        unsafe {
+            // SAFETY: Option<extern "C" fn> uses the null-pointer
+            // niche, so this is the bit pattern a C caller's NULL
+            // produces. The setter only compares it (as usize); a
+            // null fn pointer is never called.
+            let null_cb: ArapucaAuditCallback = std::mem::transmute(None::<ArapucaAuditCallback>);
+            let rc = arapuca_config_set_audit_callback(cfg, null_cb, std::ptr::null_mut());
+            assert_eq!(rc, -1, "a NULL callback must be rejected");
+
+            let rc = arapuca_config_set_audit_callback(cfg, sink, std::ptr::null_mut());
+            assert_eq!(rc, 0, "a valid callback must be accepted");
+            arapuca_config_free(cfg);
+        }
     }
 
     #[test]

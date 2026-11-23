@@ -120,7 +120,24 @@ typedef struct arapuca_ArapucaProfile arapuca_ArapucaProfile;
  */
 typedef struct arapuca_ArapucaSandbox arapuca_ArapucaSandbox;
 
-typedef struct arapuca_Option_ArapucaAuditCallback arapuca_Option_ArapucaAuditCallback;
+/**
+ * Callback type for receiving audit events as JSON.
+ *
+ * # Safety contract
+ *
+ * - `event_json` is valid only for the duration of the callback. The
+ *   callback must copy the data if it needs to retain it.
+ * - `user_data` must remain valid until `arapuca_process_cleanup()`
+ *   returns. Passing stack or freed heap memory is undefined behavior.
+ * - The callback may be invoked from any thread. The callback and
+ *   `user_data` must be safe for concurrent access.
+ * - The callback must return normally. `longjmp`, C++ exceptions, and
+ *   Go panics in cgo callbacks are undefined behavior.
+ * - The callback must not call any arapuca function (no reentrancy).
+ */
+typedef void (*arapuca_ArapucaAuditCallback)(const char *event_json,
+                                             uintptr_t event_json_len,
+                                             void *user_data);
 
 /**
  * Resource usage statistics from cgroups v2.
@@ -521,14 +538,18 @@ int32_t arapuca_config_add_env(struct arapuca_ArapucaConfig *cfg,
  * sandbox lifecycle. See `ArapucaAuditCallback` for the safety
  * contract.
  *
+ * A NULL `cb` is rejected with an error — there is no "clear the
+ * callback" path; build a fresh config instead.
+ *
  * Returns 0 on success, -1 on error.
  *
  * # Safety
- * `cfg` must be a valid pointer. `cb` must be a valid function pointer.
- * `user_data` must remain valid until `arapuca_process_cleanup()`.
+ * `cfg` must be a valid pointer. `cb` must be a valid function
+ * pointer or NULL (NULL is rejected, not called). `user_data` must
+ * remain valid until `arapuca_process_cleanup()`.
  */
 int32_t arapuca_config_set_audit_callback(struct arapuca_ArapucaConfig *cfg,
-                                          struct arapuca_Option_ArapucaAuditCallback cb,
+                                          arapuca_ArapucaAuditCallback cb,
                                           void *user_data);
 
 /**
