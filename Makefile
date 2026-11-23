@@ -118,6 +118,12 @@ package: header
 	    | sed 's/.*native-static-libs: //' > target/native-static-libs.txt
 	test -s target/native-static-libs.txt || \
 	    { echo "ERROR: failed to capture native-static-libs"; exit 1; }
+ifeq ($(shell uname -s),Darwin)
+	ro="$$(rustc --print sysroot)/lib/rustlib/$$(rustc -vV | awk '/^host:/{print $$2}')/bin/rust-objcopy"; \
+	test -x "$$ro" || { echo "ERROR: rust-objcopy not found at $$ro"; exit 1; }; \
+	"$$ro" --remove-section=__LLVM,__bitcode \
+	       --remove-section=__LLVM,__cmdline target/release/libarapuca.a
+endif
 
 # Install pre-built artifacts. Run 'make package' first (as non-root).
 install:
