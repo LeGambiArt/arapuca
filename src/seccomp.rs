@@ -350,15 +350,17 @@ pub fn apply(
     profile: &crate::SeccompProfile,
     deny_unix_sockets: bool,
     block_dumpable_zero: bool,
+    deny_fs_metadata: bool,
 ) -> crate::Result<()> {
     match profile {
         crate::SeccompProfile::Strict => {
-            let filter = build_filter(deny_unix_sockets, block_dumpable_zero)?;
+            let filter = build_filter(deny_unix_sockets, block_dumpable_zero, deny_fs_metadata)?;
             seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
             log::info!("seccomp: strict filter applied");
         }
         crate::SeccompProfile::Baseline => {
-            let filter = build_baseline_filter(deny_unix_sockets, block_dumpable_zero)?;
+            let filter =
+                build_baseline_filter(deny_unix_sockets, block_dumpable_zero, deny_fs_metadata)?;
             seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
             log::info!("seccomp: baseline filter applied");
         }
@@ -399,7 +401,11 @@ fn add_unix_socket_rules(rules: &mut HashMap<i64, Vec<SeccompRule>>) -> crate::R
 /// The filter uses a default-allow policy with explicit deny rules.
 /// This matches the Go implementation's approach: block dangerous
 /// syscalls, allow everything else.
-fn build_filter(deny_unix_sockets: bool, block_dumpable_zero: bool) -> crate::Result<BpfProgram> {
+fn build_filter(
+    deny_unix_sockets: bool,
+    block_dumpable_zero: bool,
+    deny_fs_metadata: bool,
+) -> crate::Result<BpfProgram> {
     let arch = target_arch()?;
 
     // Collect all rules: syscall -> (action, conditions).
@@ -444,6 +450,9 @@ fn build_filter(deny_unix_sockets: bool, block_dumpable_zero: bool) -> crate::Re
     let mut eperm_rules: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
     for nr in tier2_eperm_syscalls() {
         eperm_rules.insert(nr, vec![]);
+    }
+    if deny_fs_metadata {
+        add_fs_metadata_rules(&mut eperm_rules)?;
     }
 
     // Socket domain filtering: block AF_INET and AF_INET6.
@@ -567,7 +576,14 @@ fn build_filter(deny_unix_sockets: bool, block_dumpable_zero: bool) -> crate::Re
     ])
     .map_err(|e| Error::Seccomp(format!("ioctl TIOCLINUX rule: {e}")))?;
 
-    eperm_rules.insert(libc::SYS_ioctl, vec![ioctl_tiocsti, ioctl_tioclinux]);
+    // entry().extend, not insert: add_fs_metadata_rules may already
+    // have appended the chattr-class rules to this key, and insert
+    // would replace them (found by review 2026-11-23: the metadata
+    // ioctl rules were dead code in both profiles).
+    eperm_rules
+        .entry(libc::SYS_ioctl)
+        .or_default()
+        .extend([ioctl_tiocsti, ioctl_tioclinux]);
 
     // Block kill() with pid <= 0 (broadcast/group signals).
     // pid <= 0 covers kill(-1, sig) (all processes), kill(0, sig)
@@ -874,6 +890,7 @@ fn baseline_kill_syscalls() -> Vec<i64> {
 fn build_baseline_filter(
     deny_unix_sockets: bool,
     block_dumpable_zero: bool,
+    deny_fs_metadata: bool,
 ) -> crate::Result<BpfProgram> {
     let arch = target_arch()?;
 
@@ -1000,6 +1017,9 @@ fn build_baseline_filter(
     if deny_unix_sockets {
         add_unix_socket_rules(&mut eperm_rules)?;
     }
+    if deny_fs_metadata {
+        add_fs_metadata_rules(&mut eperm_rules)?;
+    }
 
     // prctl(PR_SET_PDEATHSIG, *) and prctl(PR_SET_DUMPABLE, non-zero)
     let baseline_prctl_pdeathsig = SeccompRule::new(vec![
@@ -1061,22 +1081,21 @@ fn build_baseline_filter(
         ],
     );
 
-    // ioctl(TIOCSTI/TIOCLINUX) — terminal input injection
-    eperm_rules.insert(
-        libc::SYS_ioctl,
-        vec![
-            SeccompRule::new(vec![
-                SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0x5412u64)
-                    .map_err(|e| Error::Seccomp(format!("baseline ioctl condition: {e}")))?,
-            ])
-            .map_err(|e| Error::Seccomp(format!("baseline ioctl rule: {e}")))?,
-            SeccompRule::new(vec![
-                SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0x541Cu64)
-                    .map_err(|e| Error::Seccomp(format!("baseline ioctl condition: {e}")))?,
-            ])
-            .map_err(|e| Error::Seccomp(format!("baseline ioctl rule: {e}")))?,
-        ],
-    );
+    // ioctl(TIOCSTI/TIOCLINUX) — terminal input injection.
+    // entry().extend for the same reason as the strict builder:
+    // add_fs_metadata_rules may already hold the chattr rules here.
+    eperm_rules.entry(libc::SYS_ioctl).or_default().extend(vec![
+        SeccompRule::new(vec![
+            SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0x5412u64)
+                .map_err(|e| Error::Seccomp(format!("baseline ioctl condition: {e}")))?,
+        ])
+        .map_err(|e| Error::Seccomp(format!("baseline ioctl rule: {e}")))?,
+        SeccompRule::new(vec![
+            SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0x541Cu64)
+                .map_err(|e| Error::Seccomp(format!("baseline ioctl condition: {e}")))?,
+        ])
+        .map_err(|e| Error::Seccomp(format!("baseline ioctl rule: {e}")))?,
+    ]);
 
     // kill(pid <= 0) — broadcast/group signals
     let kill_zero = SeccompRule::new(vec![
@@ -1554,7 +1573,7 @@ mod tests {
         // Verify the filter compiles without error.
         // We don't apply it here because that would restrict this test process.
         let (exited, code) = run_in_clean_child(|| {
-            if build_filter(false, false).is_ok() {
+            if build_filter(false, false, false).is_ok() {
                 unsafe { libc::_exit(42) };
             }
         });
@@ -1571,7 +1590,7 @@ mod tests {
 
         if pid == 0 {
             // Child: apply filter and run the test.
-            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, false) {
+            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, false, false) {
                 eprintln!("seccomp apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -2029,7 +2048,7 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
-            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, true) {
+            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, true, false) {
                 eprintln!("seccomp apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -2072,7 +2091,7 @@ mod tests {
         assert!(pid >= 0, "fork failed");
 
         if pid == 0 {
-            if let Err(e) = apply(&crate::SeccompProfile::Baseline, false, false) {
+            if let Err(e) = apply(&crate::SeccompProfile::Baseline, false, false, false) {
                 eprintln!("seccomp baseline apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -2329,7 +2348,7 @@ mod tests {
         ] {
             for deny in [false, true] {
                 let (exited, code) = run_in_clean_child(|| {
-                    if apply(&profile, deny, false).is_err() {
+                    if apply(&profile, deny, false, false).is_err() {
                         unsafe { libc::_exit(99) };
                     }
                     for ty in [libc::SOCK_STREAM, libc::SOCK_DGRAM] {
@@ -2516,5 +2535,136 @@ mod tests {
         });
         assert!(exited, "child should exit normally");
         assert_eq!(code, 42, "baseline: PR_SET_NAME should succeed");
+    }
+}
+
+/// Filesystem-metadata mutators denied by the `deny_fs_metadata`
+/// tier: chmod/chown/xattr/utime/truncate-class syscalls.
+///
+/// Landlock cannot restrict these on paths it otherwise grants (a
+/// documented kernel limitation, still true on 6.18), so a sandboxed
+/// process could `chmod 000 ~/.ssh` or `chmod 0666 ~/.bashrc` on a
+/// multi-user host. Every variant is denied, path-based AND fd-based:
+/// `fchmod` only checks ownership and works on `O_RDONLY` descriptors
+/// of read-granted paths, so an fd carve-out would keep both attacks
+/// alive. The one exception is `ftruncate`, which requires a
+/// write-open descriptor and is therefore already gated by Landlock
+/// write rights — in-place content mutation keeps working.
+///
+/// Tier 2 (EPERM), not kill: libraries probe these and fall back.
+fn fs_metadata_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_fchmod,
+        libc::SYS_fchmodat,
+        libc::SYS_fchown,
+        libc::SYS_fchownat,
+        libc::SYS_setxattr,
+        libc::SYS_lsetxattr,
+        libc::SYS_fsetxattr,
+        libc::SYS_removexattr,
+        libc::SYS_lremovexattr,
+        libc::SYS_fremovexattr,
+        libc::SYS_truncate,
+    ];
+    // The timestamp family (utime/utimes/utimensat/futimesat) is
+    // deliberately NOT in this list: GNU touch always issues
+    // utimensat after creating a file, so denying it breaks every
+    // build script that touches files, and the attacks this tier
+    // exists for (chmod 000, chmod 0666, xattr channels) are
+    // mode/ownership-based.
+    //
+    // chmod/chown/lchown have no syscall numbers on aarch64
+    // (asm-generic dropped them); x86_64 keeps them and libc
+    // carries the constants.
+    #[cfg(target_arch = "x86_64")]
+    {
+        v.push(libc::SYS_chmod);
+        v.push(libc::SYS_chown);
+        v.push(libc::SYS_lchown);
+        v.push(libc::SYS_fchmodat2);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        v.push(452); // fchmodat2 (Linux 6.6+)
+    }
+    // setxattrat/removexattrat (Linux 6.13+): not in libc 0.2.x.
+    // asm-generic numbering, identical on x86_64 and aarch64.
+    v.push(463); // setxattrat
+    v.push(466); // removexattrat
+    v.push(469); // file_setattr (Linux 6.17+): path-based fsxattr setter
+    v
+}
+
+/// chattr-class ioctl requests denied by the same tier: immutable
+/// and append-only flags are metadata mutation on an open fd, which
+/// neither Landlock FS rights (device ioctls only) nor the syscall
+/// list above covers. libc carries FS_IOC_SETFLAGS but not the
+/// XFS-style FS_IOC_FSSETXATTR; the kernel value is
+/// `_IOW('X', 32, struct fsxattr)` with `sizeof(struct fsxattr)`
+/// of 28 bytes (5 u32 fields plus 8 pad bytes — the 32 in the
+/// first version of this constant made the rule match nothing;
+/// verified against linux/fs.h by the 2026-11-23 review).
+fn add_fs_metadata_ioctl_rules(rules: &mut HashMap<i64, Vec<SeccompRule>>) -> crate::Result<()> {
+    const FS_IOC_FSSETXATTR: u64 = 0x401C_5820;
+    for request in [libc::FS_IOC_SETFLAGS, FS_IOC_FSSETXATTR] {
+        let condition =
+            SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, request)
+                .map_err(|e| Error::Seccomp(format!("fs metadata ioctl condition: {e}")))?;
+        let rule = SeccompRule::new(vec![condition])
+            .map_err(|e| Error::Seccomp(format!("fs metadata ioctl rule: {e}")))?;
+        rules.entry(libc::SYS_ioctl).or_default().push(rule);
+    }
+    Ok(())
+}
+
+/// Insert the metadata tier into an EPERM rule map.
+fn add_fs_metadata_rules(rules: &mut HashMap<i64, Vec<SeccompRule>>) -> crate::Result<()> {
+    for nr in fs_metadata_syscalls() {
+        rules.insert(nr, vec![]);
+    }
+    add_fs_metadata_ioctl_rules(rules)
+}
+
+#[cfg(test)]
+mod fs_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn fs_metadata_list_has_no_duplicates_or_ftruncate() {
+        let list = fs_metadata_syscalls();
+        let mut sorted = list.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), list.len(), "no duplicate entries");
+        assert!(
+            !list.contains(&libc::SYS_ftruncate),
+            "ftruncate is the carve-out: it requires a write-open fd"
+        );
+        assert!(list.contains(&libc::SYS_fchmod));
+        assert!(list.contains(&libc::SYS_fchmodat));
+        assert!(list.contains(&libc::SYS_truncate));
+        assert!(list.contains(&libc::SYS_setxattr));
+        assert!(list.contains(&libc::SYS_removexattr));
+        // The 6.13+ hardcodes.
+        assert!(list.contains(&463), "setxattrat");
+        assert!(list.contains(&466), "removexattrat");
+    }
+
+    #[test]
+    fn fs_metadata_list_arch_specifics() {
+        let list = fs_metadata_syscalls();
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(list.contains(&libc::SYS_chmod));
+            assert!(list.contains(&libc::SYS_fchmodat2));
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // fchmodat IS in the base list on every arch — glibc's
+            // chmod goes through it on aarch64, so removing it would
+            // reopen chmod there.
+            assert!(list.contains(&libc::SYS_fchmodat), "fchmodat is base");
+            assert!(list.contains(&452), "fchmodat2");
+        }
     }
 }

@@ -1265,6 +1265,25 @@ pub unsafe extern "C" fn arapuca_profile_set_no_pid_ns(
     }
 }
 
+/// Deny filesystem-metadata mutation (chmod/chown/xattr/truncate
+/// class, including chattr ioctls) with seccomp EPERM. Calling this overrides the
+/// derived default (on with the Strict seccomp profile); not
+/// calling it keeps the default.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_deny_fs_metadata(
+    profile: *mut ArapucaProfile,
+    enabled: bool,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.deny_fs_metadata = Some(enabled);
+        }
+    }
+}
+
 /// Set Landlock signal scoping explicitly (Linux, kernel ABI 6+):
 /// the sandboxed process cannot send signals to processes outside
 /// its Landlock domain. Calling this overrides the derived default
@@ -1474,6 +1493,7 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
             &inner.seccomp_profile,
             inner.deny_unix_sockets,
             block_dumpable_zero,
+            inner.effective_deny_fs_metadata(),
         ) {
             set_error(&format!("seccomp: {e}"));
             return -1;
