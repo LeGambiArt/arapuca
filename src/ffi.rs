@@ -1265,6 +1265,25 @@ pub unsafe extern "C" fn arapuca_profile_set_no_pid_ns(
     }
 }
 
+/// Restrict socket creation to an allowlist of domains (AF_UNIX,
+/// AF_NETLINK, plus AF_INET/AF_INET6 under Baseline). Calling this
+/// overrides the derived default (on with the Strict seccomp
+/// profile); not calling it keeps the default.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_restrict_socket_domains(
+    profile: *mut ArapucaProfile,
+    enabled: bool,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.restrict_socket_domains = Some(enabled);
+        }
+    }
+}
+
 /// Deny filesystem-metadata mutation (chmod/chown/xattr/truncate
 /// class, including chattr ioctls) with seccomp EPERM. Calling this overrides the
 /// derived default (on with the Strict seccomp profile); not
@@ -1494,6 +1513,7 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
             inner.deny_unix_sockets,
             block_dumpable_zero,
             inner.effective_deny_fs_metadata(),
+            inner.effective_restrict_socket_domains(),
         ) {
             set_error(&format!("seccomp: {e}"));
             return -1;

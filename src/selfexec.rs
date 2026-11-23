@@ -412,11 +412,14 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         // and the policy case additionally turns it into an EACCES.
         let block_dumpable_zero = unotify_config.is_some();
         let deny_fs_metadata = std::env::var("ARAPUCA_DENY_FS_METADATA").as_deref() == Ok("1");
+        let restrict_socket_domains =
+            std::env::var("ARAPUCA_RESTRICT_SOCKET_DOMAINS").as_deref() == Ok("1");
         if let Err(e) = crate::seccomp::apply(
             &seccomp_profile,
             deny_unix_sockets,
             block_dumpable_zero,
             deny_fs_metadata,
+            restrict_socket_domains,
         ) {
             audit_layer(audit_fd, "Seccomp", false, Some(&e.to_string()));
             write_stderr(&format!("arapuca: selfexec: seccomp: {e}\n"));

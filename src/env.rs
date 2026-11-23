@@ -408,6 +408,15 @@ pub fn wrapper_env(profile: &crate::Profile) -> crate::Result<Vec<(String, Strin
         }
         .into(),
     ));
+    env.push((
+        "ARAPUCA_RESTRICT_SOCKET_DOMAINS".into(),
+        if profile.effective_restrict_socket_domains() {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    ));
     if profile.allow_network_listeners {
         env.push(("ARAPUCA_ALLOW_NETWORK_LISTENERS".into(), "1".into()));
     }

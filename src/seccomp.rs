@@ -351,16 +351,26 @@ pub fn apply(
     deny_unix_sockets: bool,
     block_dumpable_zero: bool,
     deny_fs_metadata: bool,
+    restrict_socket_domains: bool,
 ) -> crate::Result<()> {
     match profile {
         crate::SeccompProfile::Strict => {
-            let filter = build_filter(deny_unix_sockets, block_dumpable_zero, deny_fs_metadata)?;
+            let filter = build_filter(
+                deny_unix_sockets,
+                block_dumpable_zero,
+                deny_fs_metadata,
+                restrict_socket_domains,
+            )?;
             seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
             log::info!("seccomp: strict filter applied");
         }
         crate::SeccompProfile::Baseline => {
-            let filter =
-                build_baseline_filter(deny_unix_sockets, block_dumpable_zero, deny_fs_metadata)?;
+            let filter = build_baseline_filter(
+                deny_unix_sockets,
+                block_dumpable_zero,
+                deny_fs_metadata,
+                restrict_socket_domains,
+            )?;
             seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
             log::info!("seccomp: baseline filter applied");
         }
@@ -405,6 +415,7 @@ fn build_filter(
     deny_unix_sockets: bool,
     block_dumpable_zero: bool,
     deny_fs_metadata: bool,
+    restrict_socket_domains: bool,
 ) -> crate::Result<BpfProgram> {
     let arch = target_arch()?;
 
@@ -453,6 +464,11 @@ fn build_filter(
     }
     if deny_fs_metadata {
         add_fs_metadata_rules(&mut eperm_rules)?;
+    }
+    if restrict_socket_domains {
+        // Strict already EPERMs AF_INET/AF_INET6 by their own rules;
+        // the allowlist adds every other non-UNIX, non-NETLINK family.
+        add_socket_domain_allowlist_rules(&mut eperm_rules, false)?;
     }
 
     // Socket domain filtering: block AF_INET and AF_INET6.
@@ -891,6 +907,7 @@ fn build_baseline_filter(
     deny_unix_sockets: bool,
     block_dumpable_zero: bool,
     deny_fs_metadata: bool,
+    restrict_socket_domains: bool,
 ) -> crate::Result<BpfProgram> {
     let arch = target_arch()?;
 
@@ -1019,6 +1036,11 @@ fn build_baseline_filter(
     }
     if deny_fs_metadata {
         add_fs_metadata_rules(&mut eperm_rules)?;
+    }
+    if restrict_socket_domains {
+        // Baseline keeps AF_INET/AF_INET6 (loopback listeners), so its
+        // allowlist adds them to the permitted set.
+        add_socket_domain_allowlist_rules(&mut eperm_rules, true)?;
     }
 
     // prctl(PR_SET_PDEATHSIG, *) and prctl(PR_SET_DUMPABLE, non-zero)
@@ -1573,7 +1595,7 @@ mod tests {
         // Verify the filter compiles without error.
         // We don't apply it here because that would restrict this test process.
         let (exited, code) = run_in_clean_child(|| {
-            if build_filter(false, false, false).is_ok() {
+            if build_filter(false, false, false, false).is_ok() {
                 unsafe { libc::_exit(42) };
             }
         });
@@ -1590,7 +1612,7 @@ mod tests {
 
         if pid == 0 {
             // Child: apply filter and run the test.
-            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, false, false) {
+            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, false, false, false) {
                 eprintln!("seccomp apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -2048,7 +2070,7 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
-            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, true, false) {
+            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, true, false, false) {
                 eprintln!("seccomp apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -2091,7 +2113,7 @@ mod tests {
         assert!(pid >= 0, "fork failed");
 
         if pid == 0 {
-            if let Err(e) = apply(&crate::SeccompProfile::Baseline, false, false, false) {
+            if let Err(e) = apply(&crate::SeccompProfile::Baseline, false, false, false, false) {
                 eprintln!("seccomp baseline apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -2348,7 +2370,7 @@ mod tests {
         ] {
             for deny in [false, true] {
                 let (exited, code) = run_in_clean_child(|| {
-                    if apply(&profile, deny, false, false).is_err() {
+                    if apply(&profile, deny, false, false, false).is_err() {
                         unsafe { libc::_exit(99) };
                     }
                     for ty in [libc::SOCK_STREAM, libc::SOCK_DGRAM] {
@@ -2667,4 +2689,54 @@ mod fs_metadata_tests {
             assert!(list.contains(&452), "fchmodat2");
         }
     }
+}
+
+/// Socket-domain allowlist: EPERM `socket()`/`socketpair()` for every
+/// domain outside the allowlist. The filter is otherwise
+/// default-allow with per-domain denials (AF_INET/AF_INET6 in
+/// strict), so exotic families -- AF_VSOCK notably, which bypasses
+/// network namespaces entirely, plus AF_PACKET, AF_ALG, AF_BLUETOOTH
+/// and the rest -- were reachable.
+///
+/// AF_UNIX stays allowed (governed by the stricter
+/// `deny_unix_sockets` rule). AF_NETLINK stays allowed: interface
+/// enumeration in common libraries needs it, every family gives an
+/// unprivileged process nothing beyond its host-user baseline, and
+/// the per-netns lookups mean a netns deployment leaks nothing.
+/// Strict additionally denies AF_INET/AF_INET6 via their existing
+/// rules; baseline keeps them, so its allowlist adds them.
+fn add_socket_domain_allowlist_rules(
+    rules: &mut HashMap<i64, Vec<SeccompRule>>,
+    allow_inet: bool,
+) -> crate::Result<()> {
+    let mut conditions = vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            libc::AF_UNIX as u64,
+        )
+        .map_err(|e| Error::Seccomp(format!("socket domain Ne AF_UNIX: {e}")))?,
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            libc::AF_NETLINK as u64,
+        )
+        .map_err(|e| Error::Seccomp(format!("socket domain Ne AF_NETLINK: {e}")))?,
+    ];
+    if allow_inet {
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            conditions.push(
+                SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, family as u64)
+                    .map_err(|e| Error::Seccomp(format!("socket domain Ne inet family: {e}")))?,
+            );
+        }
+    }
+    let rule = SeccompRule::new(conditions)
+        .map_err(|e| Error::Seccomp(format!("socket domain allowlist rule: {e}")))?;
+    for syscall in [libc::SYS_socket, libc::SYS_socketpair] {
+        rules.entry(syscall).or_default().push(rule.clone());
+    }
+    Ok(())
 }

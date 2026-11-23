@@ -224,6 +224,15 @@ pub struct Profile {
     /// `None` (the default) derives from the seccomp profile: on
     /// with Strict, off with Baseline. `Some(v)` is explicit.
     pub deny_fs_metadata: Option<bool>,
+    /// Restrict socket creation to an allowlist of domains
+    /// (AF_UNIX, AF_NETLINK, and — under the Baseline profile, which
+    /// permits networking — AF_INET/AF_INET6). Everything else
+    /// (AF_VSOCK, AF_PACKET, AF_ALG, ...) EPERMs. AF_VSOCK matters
+    /// most: it bypasses network namespaces entirely.
+    ///
+    /// `None` (the default) derives from the seccomp profile: on
+    /// with Strict, off with Baseline. `Some(v)` is explicit.
+    pub restrict_socket_domains: Option<bool>,
     /// Selective Unix-socket connect policy (Linux process isolation
     /// only).
     ///
@@ -352,6 +361,13 @@ impl Profile {
     /// [`Profile::effective_scope_signals`].
     pub fn effective_deny_fs_metadata(&self) -> bool {
         self.deny_fs_metadata
+            .unwrap_or(self.seccomp_profile == SeccompProfile::Strict)
+    }
+
+    /// Effective socket-domain-restriction request, same derivation
+    /// rule as [`Profile::effective_scope_signals`].
+    pub fn effective_restrict_socket_domains(&self) -> bool {
+        self.restrict_socket_domains
             .unwrap_or(self.seccomp_profile == SeccompProfile::Strict)
     }
 

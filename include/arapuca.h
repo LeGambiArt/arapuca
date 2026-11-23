@@ -666,6 +666,18 @@ void arapuca_profile_set_deny_unix_sockets(struct arapuca_ArapucaProfile *profil
 void arapuca_profile_set_no_pid_ns(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
+ * Restrict socket creation to an allowlist of domains (AF_UNIX,
+ * AF_NETLINK, plus AF_INET/AF_INET6 under Baseline). Calling this
+ * overrides the derived default (on with the Strict seccomp
+ * profile); not calling it keeps the default.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_restrict_socket_domains(struct arapuca_ArapucaProfile *profile,
+                                                 bool enabled);
+
+/**
  * Deny filesystem-metadata mutation (chmod/chown/xattr/truncate
  * class, including chattr ioctls) with seccomp EPERM. Calling this overrides the
  * derived default (on with the Strict seccomp profile); not
