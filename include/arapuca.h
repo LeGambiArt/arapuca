@@ -626,9 +626,14 @@ void arapuca_profile_set_unix_socket_connect_policy(struct arapuca_ArapucaProfil
  * No-op when the policy is `AllowAll` at launch time (roots
  * configured without the policy fail validation).
  *
+ * A NULL or non-UTF-8 `root` is recorded as an invalid entry, so the
+ * next launch fails validation instead of running with a deny root
+ * silently missing. This function cannot report the error itself
+ * (the ABI returns void).
+ *
  * # Safety
  * `profile` must be a valid pointer; `root` must be a valid
- * NUL-terminated C string.
+ * NUL-terminated C string, or NULL.
  */
 void arapuca_profile_add_unix_socket_deny_root(struct arapuca_ArapucaProfile *profile,
                                                const char *root);
