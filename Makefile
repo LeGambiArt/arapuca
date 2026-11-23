@@ -129,6 +129,7 @@ package: header
 	else \
 	    secs="--remove-section=.llvmbc --remove-section=.llvmcmd"; \
 	fi; \
+	DYLD_LIBRARY_PATH="$$(rustc --print sysroot)/lib" \
 	LD_LIBRARY_PATH="$$(rustc --print sysroot)/lib" "$$ro" $$secs target/release/libarapuca.a
 
 # Install pre-built artifacts. Run 'make package' first (as non-root).
