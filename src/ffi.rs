@@ -386,6 +386,27 @@ pub unsafe extern "C" fn arapuca_profile_set_pidns(profile: *mut ArapucaProfile,
     }
 }
 
+/// Enable/disable an empty user namespace for the sandboxed process.
+///
+/// An isolation-hardening layer, not an enforcement mechanism: the
+/// target is capless (mapping a non-root uid clears the namespace
+/// capabilities across exec) and the host network stays shared.
+/// Linux only, and exclusive with the network-namespace modes
+/// (netns, allowed hosts, network listeners, proxy socket) and with
+/// PID namespaces — the launch fails validation on a combination.
+/// No effect on non-Linux platforms.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_userns(profile: *mut ArapucaProfile, enabled: bool) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.use_userns = enabled;
+        }
+    }
+}
+
 /// Enable/disable Windows LPAC (Less Privileged AppContainer).
 ///
 /// Off by default. AppContainer confinement is always engaged on
@@ -731,6 +752,23 @@ pub unsafe extern "C" fn arapuca_config_set_stdout_fd(cfg: *mut ArapucaConfig, f
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arapuca_config_set_stderr_fd(cfg: *mut ArapucaConfig, fd: i32) -> i32 {
     set_config_fd(cfg, fd, |c, fd| c.stderr = Some(fd))
+}
+
+/// Allocate a PTY pair for the subprocess and attach the slave as its
+/// controlling terminal. Incompatible with stdin/stdout/stderr
+/// redirection: a config combining both fails validation at launch.
+/// Unix only.
+///
+/// # Safety
+/// `cfg` must be a valid pointer.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_config_set_tty(cfg: *mut ArapucaConfig, enabled: bool) {
+    if let Some(cfg) = unsafe { cfg.as_mut() } {
+        if let Some(inner) = cfg.inner.as_mut() {
+            inner.tty = enabled;
+        }
+    }
 }
 
 /// Set network proxy socket path on a config.
@@ -1199,6 +1237,30 @@ pub unsafe extern "C" fn arapuca_profile_set_deny_unix_sockets(
     }
 }
 
+/// Deny connects to the same-user session sockets: the session bus
+/// (XDG_RUNTIME_DIR/bus) and `systemd --user` private socket. Without
+/// this, a sandboxed process can start user units that run outside
+/// every sandbox layer.
+///
+/// Counts as an explicit deny-root configuration, so it requires the
+/// `DenyPrivileged` connect policy: a launch with this flag and the
+/// policy left at `AllowAll` fails validation rather than silently
+/// skipping the denial. Linux x86_64/aarch64 process isolation only.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_deny_user_session_sockets(
+    profile: *mut ArapucaProfile,
+    enabled: bool,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.deny_user_session_sockets = enabled;
+        }
+    }
+}
+
 /// Set the Unix socket connect policy (Linux process isolation only).
 /// Pass `enabled = true` for `DenyPrivileged` (deny connects to
 /// privileged daemon sockets via the unotify connect broker), or
@@ -1261,6 +1323,46 @@ pub unsafe extern "C" fn arapuca_profile_add_unix_socket_deny_root(
     inner
         .unix_socket_deny_roots
         .push(std::path::PathBuf::from(root.unwrap_or("")));
+}
+
+/// Add an exact Mach service name to grant XPC lookups for on macOS.
+/// Services are validated at launch (1-255 chars, ASCII letters,
+/// digits, dots, underscores, hyphens, spaces, parentheses; no
+/// leading hyphen; no surrounding whitespace). The list is only
+/// enforced on macOS — on other platforms the entries are ignored.
+///
+/// A NULL or non-UTF-8 `service` is recorded as an invalid entry,
+/// so the next launch fails validation instead of running with a
+/// grant silently missing. This function cannot report the error
+/// itself (the ABI returns void).
+///
+/// # Safety
+/// `profile` must be a valid pointer; `service` must be a valid
+/// NUL-terminated C string, or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_add_mach_lookup_service(
+    profile: *mut ArapucaProfile,
+    service: *const c_char,
+) {
+    let Some(profile) = (unsafe { profile.as_mut() }) else {
+        return;
+    };
+    let Some(inner) = profile.inner.as_mut() else {
+        return;
+    };
+    // SAFETY: service is a valid NUL-terminated C string per contract.
+    let service = (unsafe { service.as_ref() }).and_then(|c| {
+        // SAFETY: c points at the first byte of the NUL-terminated
+        // string above.
+        (unsafe { std::ffi::CStr::from_ptr(c) }).to_str().ok()
+    });
+    // Same fail-closed shape as the unix socket deny roots: an
+    // unusable name is pushed as an empty entry the launch rejects,
+    // because a security grant that disappears without a word is
+    // worse than a launch that fails.
+    inner
+        .mach_lookup_services
+        .push(service.unwrap_or("").to_string());
 }
 
 /// Apply sandbox restrictions to the current process. Fail-closed.
@@ -1661,6 +1763,115 @@ mod tests {
             arapuca_profile_set_network_listeners(p, true);
             assert!((*p).inner.as_ref().unwrap().allow_network_listeners);
             arapuca_profile_free(p);
+        }
+    }
+
+    #[test]
+    fn profile_set_userns_roundtrip_and_exclusivity() {
+        let p = arapuca_profile_new();
+        assert!(!p.is_null());
+        unsafe {
+            assert!(!(*p).inner.as_ref().unwrap().use_userns);
+            arapuca_profile_set_userns(p, true);
+            assert!((*p).inner.as_ref().unwrap().use_userns);
+            // The setter only records; the combination rules are the
+            // launcher's to enforce, so userns+netns must fail
+            // validation rather than one flag silently winning. The
+            // error differs by platform: Linux rejects the combination,
+            // everything else rejects the flag itself. Both fail closed.
+            arapuca_profile_set_netns(p, true);
+            let err = (*p)
+                .inner
+                .as_ref()
+                .unwrap()
+                .validate_userns()
+                .expect_err("userns+netns must fail validation");
+            #[cfg(target_os = "linux")]
+            assert!(
+                err.to_string().contains("exclusive"),
+                "unexpected error: {err}"
+            );
+            #[cfg(not(target_os = "linux"))]
+            assert!(
+                err.to_string().contains("requires Linux"),
+                "unexpected error: {err}"
+            );
+            arapuca_profile_free(p);
+        }
+    }
+
+    #[test]
+    fn profile_set_deny_user_session_sockets_requires_policy() {
+        let p = arapuca_profile_new();
+        assert!(!p.is_null());
+        unsafe {
+            arapuca_profile_set_deny_user_session_sockets(p, true);
+            assert!((*p).inner.as_ref().unwrap().deny_user_session_sockets);
+            // The flag counts as an explicit deny-root configuration,
+            // so it must not be enforceable with the policy left at
+            // AllowAll: fail closed, not silently skip the denial.
+            let err = (*p)
+                .inner
+                .as_ref()
+                .unwrap()
+                .validate_unix_socket_policy()
+                .expect_err("session-socket denial without the connect policy must fail");
+            assert!(
+                err.to_string().contains("requires"),
+                "unexpected error: {err}"
+            );
+            arapuca_profile_free(p);
+        }
+    }
+
+    #[test]
+    fn profile_add_mach_lookup_service_validates() {
+        let p = arapuca_profile_new();
+        assert!(!p.is_null());
+        unsafe {
+            // NULL: the shape an inattentive binding passes. It must
+            // poison the list, not vanish.
+            arapuca_profile_add_mach_lookup_service(p, std::ptr::null());
+            let err = (*p)
+                .inner
+                .as_ref()
+                .unwrap()
+                .validate_mach_lookup_services()
+                .expect_err("a NULL service must fail validation");
+            assert!(
+                err.to_string().contains("invalid Mach service name"),
+                "unexpected error: {err}"
+            );
+            arapuca_profile_free(p);
+        }
+
+        let p = arapuca_profile_new();
+        assert!(!p.is_null());
+        let valid = std::ffi::CString::new("com.apple.securityd").unwrap();
+        unsafe {
+            arapuca_profile_add_mach_lookup_service(p, valid.as_ptr());
+            (*p).inner
+                .as_ref()
+                .unwrap()
+                .validate_mach_lookup_services()
+                .expect("a well-formed service name must pass");
+            arapuca_profile_free(p);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_set_tty_roundtrip() {
+        let sb = arapuca_sandbox_new();
+        assert!(!sb.is_null());
+        let c = arapuca_config_new();
+        assert!(!c.is_null());
+        unsafe {
+            assert!(!(*c).inner.as_ref().unwrap().tty);
+            arapuca_config_set_tty(c, true);
+            assert!((*c).inner.as_ref().unwrap().tty);
+            arapuca_config_free(c);
+            arapuca_sandbox_free(sb);
         }
     }
 
