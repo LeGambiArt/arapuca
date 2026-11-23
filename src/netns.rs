@@ -90,3 +90,18 @@ mod tests {
         eprintln!("netns available: {result}");
     }
 }
+
+/// Runs `unshare --user --ipc --map-root-user -- /bin/true` — the
+/// exact invocation an IPC-namespace launch needs (CLONE_NEWIPC
+/// requires CAP_SYS_ADMIN over the user namespace).
+pub fn ipcns_available() -> bool {
+    let result = Command::new("unshare")
+        .args(["--user", "--ipc", "--map-root-user", "--", "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match result {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}

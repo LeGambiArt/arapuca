@@ -414,6 +414,57 @@ impl Sandbox for Linux {
             ));
         }
         let userns_active = cfg.profile.use_userns && crate::netns::userns_current_user_available();
+
+        // SysV IPC isolation rides the same user-namespace machinery
+        // as the namespace launch shapes (CLONE_NEWIPC needs
+        // CAP_SYS_ADMIN over the userns), so it derives from those
+        // shapes rather than standing alone. A requested-but-
+        // unavailable namespace degrades loudly (warning + audit
+        // skip), matching the userns pattern -- it is
+        // defense-in-depth, never load-bearing.
+        let ipcns_launch_shape = effective_use_netns || effective_use_pidns || userns_active;
+        let ipcns_requested = match cfg.profile.use_ipcns {
+            Some(explicit) => explicit,
+            None => ipcns_launch_shape,
+        };
+        // An explicit request without a namespace launch shape would
+        // be silently unenforced: --ipc only rides the unshare shapes
+        // below, and the plain Command branch never gets it. Fail
+        // closed on the combination instead of auditing a layer that
+        // does not exist (found by the 2026-11-23 review).
+        if cfg.profile.use_ipcns == Some(true) && !ipcns_launch_shape {
+            return Err(crate::Error::Validation(
+                "use_ipcns requires a namespace launch shape \
+                 (netns, pidns, or userns); a plain launch cannot isolate SysV IPC"
+                    .into(),
+            ));
+        }
+        let effective_use_ipcns = ipcns_requested && crate::netns::ipcns_available();
+        if ipcns_requested {
+            if effective_use_ipcns {
+                if let Some(ref ctx) = audit_ctx {
+                    ctx.emit(AuditEvent::LayerApplied {
+                        timestamp: ctx.timestamp(),
+                        layer: SandboxLayer::IpcNamespace,
+                        detail: None,
+                    })?;
+                }
+                applied_layers.push(SandboxLayer::IpcNamespace);
+            } else {
+                log::warn!(
+                    "ipc namespace requested but unshare --ipc is unavailable \
+                     on this host; continuing without it"
+                );
+                if let Some(ref ctx) = audit_ctx {
+                    ctx.emit(AuditEvent::LayerSkipped {
+                        timestamp: ctx.timestamp(),
+                        layer: SandboxLayer::IpcNamespace,
+                        reason: SkipReason::NotAvailable,
+                    })?;
+                }
+                skipped_layers.push(SandboxLayer::IpcNamespace);
+            }
+        }
         if cfg.profile.use_userns && !userns_active {
             log::warn!(
                 "--userns requested but user namespaces are unavailable \
@@ -450,6 +501,9 @@ impl Sandbox for Linux {
         // ── Network namespace ──────────────────────────────────────
         let mut command = if effective_use_netns {
             let mut c = Command::new("unshare");
+            if effective_use_ipcns {
+                c.arg("--ipc");
+            }
             if dns_capture_active && use_wrapper {
                 c.args(["--user", "--net", "--mount", "--map-root-user", "--"]);
             } else {
@@ -470,6 +524,9 @@ impl Sandbox for Linux {
             // PID namespace without network namespace: need a user
             // namespace for unprivileged unshare(CLONE_NEWPID).
             let mut c = Command::new("unshare");
+            if effective_use_ipcns {
+                c.arg("--ipc");
+            }
             c.args(["--user", "--map-root-user", "--"]);
             c.arg(&actual_cmd);
             c.args(&actual_args);
@@ -489,6 +546,9 @@ impl Sandbox for Linux {
             // modes (in-place exec, no extra process for the cgroup
             // pids budget).
             let mut c = Command::new("unshare");
+            if effective_use_ipcns {
+                c.arg("--ipc");
+            }
             c.args(["--user", "--map-current-user", "--"]);
             c.arg(&actual_cmd);
             c.args(&actual_args);

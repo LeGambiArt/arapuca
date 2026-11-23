@@ -1265,6 +1265,24 @@ pub unsafe extern "C" fn arapuca_profile_set_no_pid_ns(
     }
 }
 
+/// Isolate SysV IPC in a new IPC namespace. Calling this overrides
+/// the derived default (isolated whenever the user-namespace launch
+/// machinery is active); not calling it keeps the default.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_use_ipcns(
+    profile: *mut ArapucaProfile,
+    enabled: bool,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.use_ipcns = Some(enabled);
+        }
+    }
+}
+
 /// Restrict socket creation to an allowlist of domains (AF_UNIX,
 /// AF_NETLINK, plus AF_INET/AF_INET6 under Baseline). Calling this
 /// overrides the derived default (on with the Strict seccomp
@@ -2126,6 +2144,66 @@ mod scope_signals_ffi_tests {
             assert_eq!((*p).inner.as_ref().unwrap().scope_signals, Some(false));
             assert!(!(*p).inner.as_ref().unwrap().effective_scope_signals());
             arapuca_profile_free(p);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(test)]
+mod ipcns_validation_ffi_tests {
+    use super::*;
+
+    /// An explicit IPC-namespace request on a plain launch must fail
+    /// closed: --ipc only rides the unshare shapes, and a silent
+    /// no-op would audit a layer that does not exist (found by the
+    /// 2026-11-23 review).
+    ///
+    /// Linux-only: the namespace launch shapes this validation
+    /// reasons about exist only in the Linux launcher. The other
+    /// platforms ignore namespace flags wholesale, so the
+    /// fail-closed contract is observable here alone.
+    #[test]
+    fn explicit_ipcns_without_launch_shape_fails() {
+        // The launch must reach the Linux launcher's shape logic, which
+        // requires the wrapper binary to be discoverable — build it
+        // first (make test-unit does) or skip when running a bare
+        // `cargo test --lib` on a tree where it was never built.
+        if crate::env::wrapper_path().is_none() {
+            eprintln!("skipping: arapuca wrapper binary not built");
+            return;
+        }
+        let sb = arapuca_sandbox_new();
+        assert!(!sb.is_null());
+        let p = arapuca_profile_new();
+        assert!(!p.is_null());
+        let c = arapuca_config_new();
+        assert!(!c.is_null());
+        unsafe {
+            arapuca_profile_set_use_ipcns(p, true);
+            let task_id = std::ffi::CString::new("ipcns-validation-test").unwrap();
+            arapuca_config_set_task_id(c, task_id.as_ptr());
+            arapuca_config_set_profile(c, p);
+            // No netns/pidns/userns: a plain launch shape.
+            let proc = arapuca_launch(
+                sb,
+                c,
+                c"/bin/true".as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+            );
+            assert!(proc.is_null(), "launch must fail closed");
+            let err = std::ffi::CStr::from_ptr(arapuca_last_error())
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                err.contains("use_ipcns requires a namespace launch shape"),
+                "unexpected error: {err}"
+            );
+            arapuca_config_free(c);
+            arapuca_profile_free(p);
+            arapuca_sandbox_free(sb);
         }
     }
 }

@@ -666,6 +666,16 @@ void arapuca_profile_set_deny_unix_sockets(struct arapuca_ArapucaProfile *profil
 void arapuca_profile_set_no_pid_ns(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
+ * Isolate SysV IPC in a new IPC namespace. Calling this overrides
+ * the derived default (isolated whenever the user-namespace launch
+ * machinery is active); not calling it keeps the default.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_use_ipcns(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
  * Restrict socket creation to an allowlist of domains (AF_UNIX,
  * AF_NETLINK, plus AF_INET/AF_INET6 under Baseline). Calling this
  * overrides the derived default (on with the Strict seccomp

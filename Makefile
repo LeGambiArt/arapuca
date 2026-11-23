@@ -38,7 +38,12 @@ test:
 	cargo test $(if $(FEATURES),--features $(FEATURES))
 
 # Unit tests only (no integration tests — safe on all platforms).
+# The arapuca binary is built first: lib tests that launch through
+# arapuca_launch need the wrapper discoverable, and nothing else in
+# this target produces it (clippy is check-only, cargo test --lib
+# builds no bin targets).
 test-unit:
+	cargo build --bin arapuca
 	cargo test --lib
 
 # Integration tests (platform-specific).
