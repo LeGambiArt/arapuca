@@ -1246,6 +1246,25 @@ pub unsafe extern "C" fn arapuca_profile_set_deny_unix_sockets(
     }
 }
 
+/// Opt out of the PID namespace a network-namespace launch implies
+/// (inside one, signals only reach same-namespace processes).
+/// Exclusive with an explicit `arapuca_profile_set_pidns(true)`:
+/// the launch fails validation on the combination.
+///
+/// # Safety
+/// `profile` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arapuca_profile_set_no_pid_ns(
+    profile: *mut ArapucaProfile,
+    enabled: bool,
+) {
+    if let Some(profile) = unsafe { profile.as_mut() } {
+        if let Some(inner) = profile.inner.as_mut() {
+            inner.no_pid_ns = enabled;
+        }
+    }
+}
+
 /// Set Landlock signal scoping explicitly (Linux, kernel ABI 6+):
 /// the sandboxed process cannot send signals to processes outside
 /// its Landlock domain. Calling this overrides the derived default

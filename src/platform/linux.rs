@@ -55,6 +55,7 @@ impl Sandbox for Linux {
     fn launch(&self, cfg: &Config, cmd: &str, args: &[&str]) -> crate::Result<Process> {
         cfg.profile.validate_unix_socket_policy()?;
         cfg.profile.validate_userns()?;
+        cfg.profile.validate_pidns()?;
         // Validate task ID.
         crate::sanitize_task_id(&cfg.task_id)?;
 
@@ -388,6 +389,15 @@ impl Sandbox for Linux {
             || connect_proxy_socket_local.is_some()
             || cfg.network_proxy_socket.is_some();
 
+        // A network-namespace launch implies a PID namespace: inside
+        // one, kill(-1) and pid-addressed signals only reach
+        // same-namespace processes, closing the same-uid signal hole.
+        // The CLI has coupled these since the beginning; the library
+        // now matches, and no_pid_ns is the explicit opt-out. Raw
+        // use_pidns (true) stays explicit-on.
+        let effective_use_pidns =
+            cfg.profile.use_pidns || (effective_use_netns && !cfg.profile.no_pid_ns);
+
         // ── User namespace (--userns) ────────────────────────────
         // Isolation-hardening only; never part of `effective_use_netns`
         // or any bridge/DNS eligibility. A requested-but-unavailable
@@ -456,7 +466,7 @@ impl Sandbox for Linux {
             }
             applied_layers.push(SandboxLayer::NetworkNamespace);
             c
-        } else if cfg.profile.use_pidns {
+        } else if effective_use_pidns {
             // PID namespace without network namespace: need a user
             // namespace for unprivileged unshare(CLONE_NEWPID).
             let mut c = Command::new("unshare");
@@ -904,8 +914,8 @@ impl Sandbox for Linux {
         // When PID namespace is active, create a pipe for the wrapper
         // parent to report the target's host PID. Set ARAPUCA_PID_NS
         // so the wrapper knows to call unshare(CLONE_NEWPID) + fork().
-        let pid_report_pipe = if use_wrapper && (cfg.profile.use_pidns || unotify_spawn) {
-            if cfg.profile.use_pidns {
+        let pid_report_pipe = if use_wrapper && (effective_use_pidns || unotify_spawn) {
+            if effective_use_pidns {
                 command.env("ARAPUCA_PID_NS", "1");
             }
             let mut fds = [0i32; 2];
@@ -917,7 +927,7 @@ impl Sandbox for Linux {
                 pipe_guard.push(fds[0]);
                 pipe_guard.push(fds[1]);
                 Some((fds[0], fds[1]))
-            } else if cfg.profile.use_pidns {
+            } else if effective_use_pidns {
                 log::warn!("PID report pipe creation failed, continuing without pidns");
                 None
             } else {
@@ -954,7 +964,7 @@ impl Sandbox for Linux {
             memory_max_mb: cfg.profile.max_memory_mb,
             pids_max: cfg.profile.max_pids,
             cpu_max_pct: cfg.profile.max_cpu_pct,
-            pids_overhead: (if cfg.profile.use_pidns { 1 } else { 0 })
+            pids_overhead: (if effective_use_pidns { 1 } else { 0 })
                 + (if effective_use_netns { 1 } else { 0 }),
         };
 
@@ -1111,7 +1121,7 @@ impl Sandbox for Linux {
         applied_layers.push(SandboxLayer::FdSanitization);
 
         if let Some(ref ctx) = audit_ctx {
-            if cfg.profile.use_pidns && pid_report_pipe.is_some() {
+            if effective_use_pidns && pid_report_pipe.is_some() {
                 ctx.emit(AuditEvent::LayerApplied {
                     timestamp: ctx.timestamp(),
                     layer: SandboxLayer::PidNamespace,
@@ -1119,7 +1129,7 @@ impl Sandbox for Linux {
                 })?;
                 applied_layers.push(SandboxLayer::PidNamespace);
             } else {
-                let reason = if !cfg.profile.use_pidns {
+                let reason = if !effective_use_pidns {
                     SkipReason::NotConfigured
                 } else {
                     SkipReason::PartialFailure("PID report pipe creation failed".into())
@@ -1591,7 +1601,7 @@ impl Sandbox for Linux {
             unotify_audit_pipe: unotify_audit_read_fd,
             pidfd,
             target_pid: stored_target_pid,
-            pidns_active: cfg.profile.use_pidns,
+            pidns_active: effective_use_pidns,
             waited: false,
             connect_proxy_pid: connect_proxy_pid_local,
             connect_proxy_pidfd: connect_proxy_pidfd_local,
