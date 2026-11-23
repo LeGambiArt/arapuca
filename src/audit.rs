@@ -294,6 +294,8 @@ pub enum SandboxLayer {
     Landlock,
     /// Landlock signal scoping (Scope::Signal, ABI 6+).
     SignalScope,
+    /// IPC namespace isolation (SysV shm/sem/msg).
+    IpcNamespace,
     Seccomp,
     Cgroup,
     NetworkNamespace,

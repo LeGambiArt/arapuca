@@ -160,6 +160,10 @@ pub struct Profile {
     /// with `use_netns`: the two are mutually exclusive, and this
     /// flag must not leak into network-namespace, bridge, or DNS
     /// eligibility anywhere.
+    ///
+    /// One namespace does ride along by default: SysV IPC
+    /// isolation (`use_ipcns` derives on for this shape too).
+    /// Opt out with `use_ipcns: Some(false)`.
     pub use_userns: bool,
     /// Enable DNS query capture inside the network namespace.
     ///
@@ -233,6 +237,21 @@ pub struct Profile {
     /// `None` (the default) derives from the seccomp profile: on
     /// with Strict, off with Baseline. `Some(v)` is explicit.
     pub restrict_socket_domains: Option<bool>,
+    /// Isolate SysV IPC (and, with a /dev/mqueue remount, POSIX
+    /// message queues) in a new IPC namespace. Without it, a
+    /// sandboxed process can `shmat` by ID onto any segment owned
+    /// by the same uid — X11 MIT-SHM buffers included — reading and
+    /// writing shared memory outside every other confinement layer.
+    ///
+    /// `None` (the default) isolates whenever the user-namespace
+    /// machinery is active (netns, pidns, or standalone userns
+    /// launch shapes); `Some(false)` opts out for callers that need
+    /// host SysV IPC. An explicit `Some(true)` without a namespace
+    /// launch shape is a validation error, not a silent no-op.
+    /// POSIX mqueues are isolated for `mq_open` (it resolves through
+    /// the namespace's mount); path access through the host's
+    /// `/dev/mqueue` mount follows Landlock instead.
+    pub use_ipcns: Option<bool>,
     /// Selective Unix-socket connect policy (Linux process isolation
     /// only).
     ///
