@@ -2559,6 +2559,8 @@ fn image_setup(args: &[String]) {
         #[cfg(unix)]
         tty: false,
         network_proxy_socket: None,
+        #[cfg(target_os = "linux")]
+        allowed_hosts: Vec::new(),
         env: Vec::new(),
         audit_sink: None,
         audit_verbosity: arapuca::audit::AuditVerbosity::Standard,
@@ -3506,6 +3508,8 @@ fn vm_run(args: &[String]) {
         #[cfg(unix)]
         tty: false,
         network_proxy_socket: None,
+        #[cfg(target_os = "linux")]
+        allowed_hosts: Vec::new(),
         env,
         audit_sink: None,
         audit_verbosity: arapuca::audit::AuditVerbosity::Standard,

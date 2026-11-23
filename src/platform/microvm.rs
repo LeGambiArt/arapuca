@@ -449,7 +449,11 @@ fn launch_vm(
     let pidfd = {
         let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) };
         if ret >= 0 {
-            Some(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(ret as i32) })
+            // SAFETY: ret is a fresh descriptor owned by this scope.
+            Some(unsafe {
+                use std::os::fd::FromRawFd;
+                std::os::fd::OwnedFd::from_raw_fd(ret as i32)
+            })
         } else {
             None
         }
@@ -464,6 +468,13 @@ fn launch_vm(
         cgroup_mgr: None,
         #[cfg(target_os = "linux")]
         dns_audit_pipe: None,
+        #[cfg(target_os = "linux")]
+        unotify_audit_pipe: None,
+        #[cfg(target_os = "linux")]
+        pidns_active: false,
+        connect_proxy_pid: None,
+        connect_proxy_pidfd: None,
+        connect_proxy_socket: None,
         #[cfg(target_os = "linux")]
         pidfd,
         #[cfg(target_os = "linux")]
