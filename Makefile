@@ -122,8 +122,17 @@ package: header
 	# and the sections differ per object format: __LLVM,__bitcode and
 	# __LLVM,__cmdline on Mach-O, .llvmbc and .llvmcmd on ELF. Strip
 	# both so Go consumers can link the staticlib on any platform.
+	# rustup ships rust-objcopy in the rustlib sysroot, but distro
+	# toolchains (Fedora's rustc RPM) do not -- fall back to PATH
+	# lookups: llvm-objcopy takes the same flags, and GNU objcopy
+	# (binutils, present wherever gcc is) covers ELF builds where
+	# neither rust tool is installed.
 	ro="$$(rustc --print sysroot)/lib/rustlib/$$(rustc -vV | awk '/^host:/{print $$2}')/bin/rust-objcopy"; \
-	test -x "$$ro" || { echo "ERROR: rust-objcopy not found at $$ro"; exit 1; }; \
+	if [ ! -x "$$ro" ]; then \
+	    ro="$$(command -v rust-objcopy || command -v llvm-objcopy || command -v objcopy)"; \
+	fi; \
+	test -n "$$ro" && test -x "$$ro" || \
+	    { echo "ERROR: no objcopy found (rustlib sysroot, rust-objcopy, llvm-objcopy, objcopy)"; exit 1; }; \
 	if [ "$$(uname -s)" = Darwin ]; then \
 	    secs="--remove-section=__LLVM,__bitcode --remove-section=__LLVM,__cmdline"; \
 	else \
