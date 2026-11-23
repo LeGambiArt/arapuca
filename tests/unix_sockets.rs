@@ -755,12 +755,22 @@ fn compatibility_gate_and_enforcement_oracle_cover_version_skew() {
         };
         std::fs::write(&wrapper, format!("#!/bin/sh\nif [ \"$1\" = --wrapper-capabilities ]; then {response}; fi\nshift\nexec \"$@\"\n")).unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let out = Command::new(&consumer)
-            .args(["--exact", "wrapper_compatibility_fixture", "--nocapture"])
+        let mut cmd = Command::new(&consumer);
+        cmd.args(["--exact", "wrapper_compatibility_fixture", "--nocapture"])
             .env("UNIX_POLICY_WRAPPER_FIXTURE", kind)
-            .env("UNIX_POLICY_WRAPPER_DIR", dir.path())
-            .output()
-            .unwrap();
+            .env("UNIX_POLICY_WRAPPER_DIR", dir.path());
+        // ETXTBSY: the exec can race the copy that just wrote
+        // `consumer` -- same class as the supervisor binary-swap
+        // race, which retries instead of panicking.
+        let out = loop {
+            match cmd.output() {
+                Ok(out) => break out,
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => panic!("run consumer: {e}"),
+            }
+        };
         assert!(
             out.status.success(),
             "{} {}",
