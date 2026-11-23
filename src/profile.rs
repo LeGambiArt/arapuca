@@ -191,6 +191,16 @@ pub struct Profile {
     /// Linux x86_64/aarch64 process isolation. Unsupported requests fail.
     /// Runtimes using Unix sockets or socketpairs may require this off.
     pub deny_unix_sockets: bool,
+    /// Landlock signal scoping (Linux, kernel ABI 6+): the sandboxed
+    /// process cannot send signals to processes outside its Landlock
+    /// domain — closing `kill(-1, SIGKILL)` and friends against the
+    /// supervising user's other processes.
+    ///
+    /// `None` (the default) derives from the seccomp profile: on with
+    /// Strict, off with Baseline. `Some(v)` is explicit. On kernels
+    /// below ABI 6 the scope is skipped with an audit event, never a
+    /// failed run.
+    pub scope_signals: Option<bool>,
     /// Selective Unix-socket connect policy (Linux process isolation
     /// only).
     ///
@@ -305,6 +315,16 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Effective signal-scoping request: `None` follows the seccomp
+    /// profile (Strict locks it on, Baseline leaves it off), an
+    /// explicit value wins. Computed where the real profile lives —
+    /// the launcher — never in the wrapper, whose reconstructed
+    /// profile always reads as Strict.
+    pub fn effective_scope_signals(&self) -> bool {
+        self.scope_signals
+            .unwrap_or(self.seccomp_profile == SeccompProfile::Strict)
+    }
+
     /// Validate the `use_userns` combination rules.
     ///
     /// Fail-closed on ambiguous requests rather than choosing a
@@ -619,5 +639,26 @@ mod userns_tests {
         assert!(profile.validate_userns().is_err());
         profile.use_pidns = false;
         assert!(profile.validate_userns().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod scope_signals_tests {
+    use super::*;
+
+    #[test]
+    fn scope_signals_derives_from_seccomp_profile() {
+        let mut p = Profile::default();
+        assert_eq!(p.seccomp_profile, SeccompProfile::Strict);
+        assert!(p.effective_scope_signals(), "Strict default locks it on");
+
+        p.seccomp_profile = SeccompProfile::Baseline;
+        assert!(!p.effective_scope_signals(), "Baseline leaves it off");
+
+        p.scope_signals = Some(true);
+        assert!(p.effective_scope_signals(), "explicit Some(true) wins");
+
+        p.scope_signals = Some(false);
+        assert!(!p.effective_scope_signals(), "explicit Some(false) wins");
     }
 }

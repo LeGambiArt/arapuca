@@ -47,7 +47,11 @@ use crate::{Error, Profile};
 /// blocking against command injection requires seccomp `execve`
 /// interception (future work).
 #[must_use = "landlock errors must be handled — the process may be unsandboxed"]
-pub fn apply(profile: &Profile, target_binary: Option<&Path>) -> crate::Result<()> {
+pub fn apply(
+    profile: &Profile,
+    target_binary: Option<&Path>,
+    scope_signals: bool,
+) -> crate::Result<()> {
     let read_paths = &profile.read_paths;
     let write_paths = &profile.write_paths;
 
@@ -57,7 +61,12 @@ pub fn apply(profile: &Profile, target_binary: Option<&Path>) -> crate::Result<(
 
     // Use the highest ABI we fully support. The crate handles
     // best-effort downgrade for access rights added in later ABIs.
-    let abi = ABI::V5;
+    // V7, not V9: all AccessFs rights predate V5 (V5 adds IoctlDev,
+    // nothing after until V9's ResolveUnix), so the filesystem set
+    // is identical to the old V5 pin — only the scope set grows
+    // (Signal, AbstractUnixSocket at V6). V9 would change write
+    // rights; stop here deliberately.
+    let abi = ABI::V7;
 
     let read_access = if profile.allow_exec {
         make_bitflags!(AccessFs::{ Execute | ReadFile | ReadDir })
@@ -78,6 +87,18 @@ pub fn apply(profile: &Profile, target_binary: Option<&Path>) -> crate::Result<(
         builder = builder
             .scope(Scope::AbstractUnixSocket)
             .map_err(|e| Error::Landlock(format!("scope AbstractUnixSocket: {e}")))?;
+    }
+    // Signal scoping: the target cannot signal processes outside
+    // its Landlock domain (kill/kill(-1)/pidfd routes). Same-domain
+    // helpers (bridge, pidns relay — forked after this apply) stay
+    // reachable, which is why this composes with the pidns relay.
+    // The caller gates on signal_scope_supported(); requesting the
+    // scope on an older kernel would rely on the crate's silent
+    // BestEffort downgrade, which we do not want.
+    if scope_signals {
+        builder = builder
+            .scope(Scope::Signal)
+            .map_err(|e| Error::Landlock(format!("scope Signal: {e}")))?;
     }
     let mut ruleset = builder
         .create()
@@ -263,7 +284,21 @@ mod tests {
     #[test]
     fn empty_paths_is_noop() {
         let profile = Profile::default();
-        assert!(apply(&profile, None).is_ok());
+        assert!(apply(&profile, None, false).is_ok());
+    }
+
+    /// Write grants must include symlink creation: the wrapper's
+    /// documented behavior (and consumers' TOCTOU reasoning) builds
+    /// on it. A future ABI pin bump that silently dropped MakeSym
+    /// from the write set would change the security surface, so pin
+    /// it here.
+    #[test]
+    fn write_grants_include_symlink_creation() {
+        let write_access = AccessFs::from_all(ABI::V7) & !make_bitflags!(AccessFs::{ Execute });
+        assert!(
+            write_access.contains(AccessFs::MakeSym),
+            "write rights must carry MakeSym"
+        );
     }
 
     #[test]
@@ -274,4 +309,12 @@ mod tests {
         eprintln!("landlock ABI version: {v}");
         // Just assert it doesn't panic.
     }
+}
+
+/// Whether the running kernel's Landlock ABI carries `Scope::Signal`
+/// (ABI 6, Linux 6.12+). Callers gate the scope request on this and
+/// skip loudly (audit event) on old kernels instead of relying on
+/// the crate's silent best-effort downgrade.
+pub fn signal_scope_supported() -> bool {
+    abi_version() >= 6
 }

@@ -385,6 +385,20 @@ pub fn wrapper_env(profile: &crate::Profile) -> crate::Result<Vec<(String, Strin
         "ARAPUCA_DENY_UNIX_SOCKETS".into(),
         if profile.deny_unix_sockets { "1" } else { "0" }.into(),
     ));
+    // Derived launcher-side (the wrapper's reconstructed profile
+    // always reads as Strict, so the None-default is incomputable
+    // there) and gated on the kernel ABI: requesting the scope on a
+    // pre-6.12 kernel would hit the crate's silent best-effort
+    // downgrade. The launcher emits the matching audit skip.
+    #[cfg(target_os = "linux")]
+    let scope_signals =
+        profile.effective_scope_signals() && crate::landlock::signal_scope_supported();
+    #[cfg(not(target_os = "linux"))]
+    let scope_signals = false;
+    env.push((
+        "ARAPUCA_SCOPE_SIGNALS".into(),
+        if scope_signals { "1" } else { "0" }.into(),
+    ));
     if profile.allow_network_listeners {
         env.push(("ARAPUCA_ALLOW_NETWORK_LISTENERS".into(), "1".into()));
     }
@@ -1308,5 +1322,39 @@ mod tests {
                 p.display()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod scope_signals_env_tests {
+    use super::*;
+
+    fn value_for(profile: &crate::Profile) -> String {
+        wrapper_env(profile)
+            .unwrap()
+            .into_iter()
+            .find(|(k, _)| k == "ARAPUCA_SCOPE_SIGNALS")
+            .map(|(_, v)| v)
+            .expect("ARAPUCA_SCOPE_SIGNALS always emitted")
+    }
+
+    #[test]
+    fn scope_signals_env_follows_explicit_off() {
+        // Kernel-independent: an explicit opt-out must reach the
+        // wrapper as 0 whatever the running kernel supports.
+        let profile = crate::Profile {
+            scope_signals: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(value_for(&profile), "0");
+    }
+
+    #[test]
+    fn scope_signals_env_off_with_baseline() {
+        let profile = crate::Profile {
+            seccomp_profile: crate::SeccompProfile::Baseline,
+            ..Default::default()
+        };
+        assert_eq!(value_for(&profile), "0");
     }
 }

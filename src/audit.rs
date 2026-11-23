@@ -292,6 +292,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum SandboxLayer {
     Landlock,
+    /// Landlock signal scoping (Scope::Signal, ABI 6+).
+    SignalScope,
     Seccomp,
     Cgroup,
     NetworkNamespace,
@@ -364,6 +366,7 @@ pub enum SkipReason {
     NotAvailable,
     NotConfigured,
     PlatformUnsupported,
+    KernelUnsupported,
     ComponentMissing(String),
     PartialFailure(String),
 }
