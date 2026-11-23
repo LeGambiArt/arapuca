@@ -293,6 +293,22 @@ int32_t arapuca_profile_set_seccomp(struct arapuca_ArapucaProfile *profile,
 void arapuca_profile_set_pidns(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
+ * Enable/disable an empty user namespace for the sandboxed process.
+ *
+ * An isolation-hardening layer, not an enforcement mechanism: the
+ * target is capless (mapping a non-root uid clears the namespace
+ * capabilities across exec) and the host network stays shared.
+ * Linux only, and exclusive with the network-namespace modes
+ * (netns, allowed hosts, network listeners, proxy socket) and with
+ * PID namespaces — the launch fails validation on a combination.
+ * No effect on non-Linux platforms.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_userns(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
  * Enable/disable Windows LPAC (Less Privileged AppContainer).
  *
  * Off by default. AppContainer confinement is always engaged on
@@ -444,6 +460,17 @@ int32_t arapuca_config_set_stdout_fd(struct arapuca_ArapucaConfig *cfg, int32_t 
  * `cfg` must be a valid pointer.
  */
 int32_t arapuca_config_set_stderr_fd(struct arapuca_ArapucaConfig *cfg, int32_t fd);
+
+/**
+ * Allocate a PTY pair for the subprocess and attach the slave as its
+ * controlling terminal. Incompatible with stdin/stdout/stderr
+ * redirection: a config combining both fails validation at launch.
+ * Unix only.
+ *
+ * # Safety
+ * `cfg` must be a valid pointer.
+ */
+void arapuca_config_set_tty(struct arapuca_ArapucaConfig *cfg, bool enabled);
 
 /**
  * Set network proxy socket path on a config.
@@ -607,6 +634,23 @@ void arapuca_process_cleanup(struct arapuca_ArapucaProcess *proc);
 void arapuca_profile_set_deny_unix_sockets(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
+ * Deny connects to the same-user session sockets: the session bus
+ * (XDG_RUNTIME_DIR/bus) and `systemd --user` private socket. Without
+ * this, a sandboxed process can start user units that run outside
+ * every sandbox layer.
+ *
+ * Counts as an explicit deny-root configuration, so it requires the
+ * `DenyPrivileged` connect policy: a launch with this flag and the
+ * policy left at `AllowAll` fails validation rather than silently
+ * skipping the denial. Linux x86_64/aarch64 process isolation only.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_deny_user_session_sockets(struct arapuca_ArapucaProfile *profile,
+                                                   bool enabled);
+
+/**
  * Set the Unix socket connect policy (Linux process isolation only).
  * Pass `enabled = true` for `DenyPrivileged` (deny connects to
  * privileged daemon sockets via the unotify connect broker), or
@@ -637,6 +681,25 @@ void arapuca_profile_set_unix_socket_connect_policy(struct arapuca_ArapucaProfil
  */
 void arapuca_profile_add_unix_socket_deny_root(struct arapuca_ArapucaProfile *profile,
                                                const char *root);
+
+/**
+ * Add an exact Mach service name to grant XPC lookups for on macOS.
+ * Services are validated at launch (1-255 chars, ASCII letters,
+ * digits, dots, underscores, hyphens, spaces, parentheses; no
+ * leading hyphen; no surrounding whitespace). The list is only
+ * enforced on macOS — on other platforms the entries are ignored.
+ *
+ * A NULL or non-UTF-8 `service` is recorded as an invalid entry,
+ * so the next launch fails validation instead of running with a
+ * grant silently missing. This function cannot report the error
+ * itself (the ABI returns void).
+ *
+ * # Safety
+ * `profile` must be a valid pointer; `service` must be a valid
+ * NUL-terminated C string, or NULL.
+ */
+void arapuca_profile_add_mach_lookup_service(struct arapuca_ArapucaProfile *profile,
+                                             const char *service);
 
 /**
  * Apply sandbox restrictions to the current process. Fail-closed.
