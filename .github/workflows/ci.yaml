@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The advisory database moves independently of this repository, so
+  # the audit job below also runs on a schedule.
+  schedule:
+    - cron: '17 6 * * 1'
 
 permissions:
   contents: read
@@ -68,3 +72,19 @@ jobs:
 
       - name: Integration tests
         run: chmod +x scripts/run-integration-tests.sh && make test-integration
+
+  audit:
+    # Deliberately not on pull requests: a new advisory against
+    # untouched code must not fail an unrelated change. It runs on
+    # pushes to main and weekly, where a failure means someone should
+    # look rather than someone broke their build.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Check advisories, licences, bans and sources
+        run: cargo deny check

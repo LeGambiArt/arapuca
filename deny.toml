@@ -1,0 +1,45 @@
+# cargo-deny policy: `cargo deny check` on a clean tree must pass.
+#
+# The advisory database moves independently of this repository, so the
+# advisory check runs in CI on pushes to main and on a schedule, not on
+# every pull request: a new advisory against untouched code must not
+# block an unrelated change.
+
+[advisories]
+version = 2
+# A yanked version in the lockfile is a supply-chain problem, not a
+# style issue.
+yanked = "deny"
+# Advisories that do not apply to this tree, with the reason. Keep the
+# list short and justify each entry: an unexamined ignore is how a real
+# advisory gets missed.
+ignore = [
+    # rustls, rustls-webpki, webpki-roots, quinn and tokio arrive only
+    # through reqwest under the `microvm` feature (HTTPS image
+    # downloads). They are updated with every release that touches the
+    # feature, so ignore entries here would go stale -- none are listed.
+]
+
+[licenses]
+# Fedora-compatible set. The crates offering a choice (r-efi offers
+# LGPL-2.1-or-later as one option) satisfy this through MIT or
+# Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicates are informative here, not fatal: the tree legitimately
+# carries several major versions of the same crate (windows-sys,
+# rand), and Fedora vendors them all.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
