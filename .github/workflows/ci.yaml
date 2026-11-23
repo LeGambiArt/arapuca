@@ -19,12 +19,23 @@ jobs:
     container: registry.fedoraproject.org/fedora:latest
     steps:
       - name: Install deps
-        run: dnf install -y gcc make cargo clippy rustfmt libkrun-devel openssl-devel clang-devel qemu-img
+        run: dnf install -y gcc make git-core cargo clippy rustfmt libkrun-devel openssl-devel clang-devel qemu-img cbindgen
 
       - uses: actions/checkout@v7.0.1
 
       - name: Check (fmt + clippy + unit tests)
         run: make check
+
+      # include/arapuca.h is generated and committed. Sharing it with
+      # C and Go consumers means a doc or signature change that skips
+      # the regenerated header leaves them reading the old contract.
+      - name: Check the C header is up to date
+        run: |
+          make header
+          # The container runs as root and the workspace is owned by
+          # the runner user, so git refuses the repository as dubious
+          # ownership unless it is named explicitly.
+          git -c safe.directory="$PWD" diff --exit-code include/arapuca.h
 
   check-macos:
     runs-on: macos-latest
