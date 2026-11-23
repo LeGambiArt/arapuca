@@ -1358,6 +1358,7 @@ fn run_subcommand(args: &[String]) {
         allow_exec: true,
         use_netns,
         use_pidns: use_netns && !no_pid_ns,
+        no_pid_ns,
         use_userns: userns,
         dns_capture: deny_network,
         lpac,

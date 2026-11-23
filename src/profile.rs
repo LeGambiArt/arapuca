@@ -191,6 +191,13 @@ pub struct Profile {
     /// Linux x86_64/aarch64 process isolation. Unsupported requests fail.
     /// Runtimes using Unix sockets or socketpairs may require this off.
     pub deny_unix_sockets: bool,
+    /// Opt out of the PID namespace that a network-namespace launch
+    /// implies. Inside a PID namespace, `kill(-1)` and pid-addressed
+    /// signals only reach same-namespace processes, so the default
+    /// couples the two; callers that genuinely need host-PID
+    /// visibility set this. Exclusive with `use_pidns` (a profile
+    /// combining both is a validation error).
+    pub no_pid_ns: bool,
     /// Landlock signal scoping (Linux, kernel ABI 6+): the sandboxed
     /// process cannot send signals to processes outside its Landlock
     /// domain — closing `kill(-1, SIGKILL)` and friends against the
@@ -323,6 +330,18 @@ impl Profile {
     pub fn effective_scope_signals(&self) -> bool {
         self.scope_signals
             .unwrap_or(self.seccomp_profile == SeccompProfile::Strict)
+    }
+
+    /// Validate the PID-namespace opt-out: it is meaningless (and
+    /// ambiguous) alongside an explicit `use_pidns`, so fail closed
+    /// on the combination instead of guessing which one wins.
+    pub fn validate_pidns(&self) -> crate::Result<()> {
+        if self.no_pid_ns && self.use_pidns {
+            return Err(crate::Error::Validation(
+                "no_pid_ns is exclusive with use_pidns: pick one".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Validate the `use_userns` combination rules.
@@ -660,5 +679,27 @@ mod scope_signals_tests {
 
         p.scope_signals = Some(false);
         assert!(!p.effective_scope_signals(), "explicit Some(false) wins");
+    }
+}
+
+#[cfg(test)]
+mod pidns_coupling_tests {
+    use super::*;
+
+    #[test]
+    fn no_pid_ns_is_exclusive_with_use_pidns() {
+        let p = Profile {
+            no_pid_ns: true,
+            use_pidns: true,
+            ..Default::default()
+        };
+        let err = p.validate_pidns().expect_err("combination must fail");
+        assert!(err.to_string().contains("exclusive"), "unexpected: {err}");
+
+        let ok = Profile {
+            no_pid_ns: true,
+            ..Default::default()
+        };
+        assert!(ok.validate_pidns().is_ok());
     }
 }

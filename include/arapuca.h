@@ -655,6 +655,17 @@ void arapuca_process_cleanup(struct arapuca_ArapucaProcess *proc);
 void arapuca_profile_set_deny_unix_sockets(struct arapuca_ArapucaProfile *profile, bool enabled);
 
 /**
+ * Opt out of the PID namespace a network-namespace launch implies
+ * (inside one, signals only reach same-namespace processes).
+ * Exclusive with an explicit `arapuca_profile_set_pidns(true)`:
+ * the launch fails validation on the combination.
+ *
+ * # Safety
+ * `profile` must be a valid pointer.
+ */
+void arapuca_profile_set_no_pid_ns(struct arapuca_ArapucaProfile *profile, bool enabled);
+
+/**
  * Set Landlock signal scoping explicitly (Linux, kernel ABI 6+):
  * the sandboxed process cannot send signals to processes outside
  * its Landlock domain. Calling this overrides the derived default

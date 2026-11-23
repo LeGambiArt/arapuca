@@ -219,3 +219,58 @@ fn pidns_exec_chain_works() {
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "chain-ok");
 }
+
+// ─── Netns implies pidns (library-level coupling) ──────────────
+
+/// NSpid line from inside the sandbox: multiple PID entries mean the
+/// process sits in a PID namespace; a single entry means host PIDs.
+fn nspid_count(args: &[&str]) -> usize {
+    let output = Command::new(arapuca_bin())
+        .args(["run"])
+        .args(args)
+        .arg("--")
+        .args(["/bin/sh", "-c", "grep NSpid /proc/self/status"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("NSpid:"))
+        .expect("NSpid line present");
+    line.split_whitespace().skip(1).count()
+}
+
+/// A network-namespace launch must land in a PID namespace without
+/// the caller asking for one: the library now matches the CLI's
+/// long-standing coupling, closing kill(-1) against same-uid host
+/// processes for every consumer on upgrade.
+#[test]
+fn netns_implies_pidns() {
+    if !pidns_available() {
+        eprintln!("skipping: user/net namespace not available");
+        return;
+    }
+    assert!(
+        nspid_count(&["--deny-network", "--seccomp", "baseline"]) > 1,
+        "netns launch must sit in a PID namespace"
+    );
+}
+
+/// The explicit opt-out keeps host PID visibility.
+#[test]
+fn no_pid_ns_opt_out_keeps_host_pids() {
+    if !pidns_available() {
+        eprintln!("skipping: user/net namespace not available");
+        return;
+    }
+    assert_eq!(
+        nspid_count(&["--deny-network", "--seccomp", "baseline", "--no-pid-ns"]),
+        1,
+        "--no-pid-ns must keep the target in the host PID namespace"
+    );
+}
