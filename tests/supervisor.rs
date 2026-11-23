@@ -200,8 +200,24 @@ fn children_of(pid: u32) -> Vec<i32> {
     out
 }
 
+/// Whether `pid` is a live (running or sleeping) process.
+///
+/// A zombie still has a /proc entry: it has exited but nothing has
+/// reaped it yet. That is the state a killed target sits in when its
+/// parent died before it (the supervisor is gone, and a container's
+/// PID 1 may not reap orphans), so a plain /proc existence check
+/// counts a dead process as alive and the test times out on slow
+/// reapers.
 fn pid_alive(pid: i32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // Field 3 (state) follows the parenthesised comm, which may itself
+    // contain spaces or parentheses: split after the last ')'.
+    let Some(after) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+        return false;
+    };
+    !matches!(after.split_whitespace().next(), Some("Z") | Some("X"))
 }
 
 fn open_ptty() -> (std::fs::File, std::fs::File) {
@@ -1100,4 +1116,43 @@ fn tty_ctrl_z_is_discarded_not_wedging_the_run() {
         "Ctrl-Z must be discarded (orphaned group), not stop the run: \
          status={status:?} output={out:?}"
     );
+}
+
+#[test]
+fn pid_alive_does_not_count_zombies() {
+    // A killed target whose parent is already gone sits as a zombie
+    // until something reaps it. The death oracles must not read that
+    // as "still alive", or they time out on hosts with a slow reaper
+    // (a container whose PID 1 does not reap orphans, for instance).
+    // SAFETY: fork with no arguments; the child exits immediately.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork");
+    if pid == 0 {
+        // SAFETY: _exit never returns.
+        unsafe { libc::_exit(0) };
+    }
+    // Wait for the child to exit WITHOUT reaping it, leaving a zombie.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, r)| r.split_whitespace().next().map(str::to_owned));
+        if state.as_deref() == Some("Z") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child never reached the zombie state: {stat:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "a zombie must still have a /proc entry (the case being guarded)"
+    );
+    assert!(!pid_alive(pid), "a zombie is not alive");
+    // SAFETY: reap the zombie we created.
+    let mut status = 0i32;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
 }
