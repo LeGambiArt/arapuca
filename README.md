@@ -583,15 +583,22 @@ case.
 
 Three tiers with different responses (strict profile):
 
-**Tier 1 — KILL_PROCESS** (45 syscalls, no legitimate use):
+**Tier 1 — KILL_PROCESS** (44 syscalls, no legitimate use):
 `ptrace`, `mount`, `umount2`, `chroot`, `pivot_root`, `unshare`,
 `setns`, `personality`, `memfd_create`, `memfd_secret`,
 `bpf`, `kexec_*`, `reboot`, kernel module syscalls, new mount API
 (`fsopen`, `fsmount`, `fspick`, `fsconfig`, `move_mount`, `open_tree`,
-`mount_setattr`), `pidfd_getfd`, `pidfd_send_signal`,
+`mount_setattr`), `pidfd_getfd`,
 `process_vm_readv/writev`, `process_madvise`, `userfaultfd`, `kcmp`,
 `landlock_*`, `swapon`, `swapoff`, `acct`, `add_key/request_key/keyctl`,
 `quotactl*`, LSM self-attr.
+
+`pidfd_send_signal` is deliberately not killed: `kill(2)` of a
+specific pid is already permitted under both profiles, so the pidfd
+form adds no capability, and the Go runtime's `os.Process` requires
+it. `pidfd_getfd` (fd stealing) stays killed. Under the Strict
+profile the Landlock Signal scope confines `pidfd_send_signal` to
+the sandbox's own domain on kernel ABI 6+.
 
 **Tier 2 — EPERM** (argument-filtered): `symlinkat`, `linkat`,
 `socket(AF_INET|AF_INET6)`, `perf_event_open`,

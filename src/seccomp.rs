@@ -767,7 +767,16 @@ fn tier1_kill_syscalls() -> Vec<i64> {
         libc::SYS_fsmount,
         libc::SYS_fspick,
         libc::SYS_pidfd_getfd,
-        libc::SYS_pidfd_send_signal,
+        // pidfd_send_signal is deliberately NOT killed: it grants no
+        // capability kill(2) does not already grant under these
+        // profiles (kill of a specific same-uid pid is allowed; only
+        // broadcast pid <= 0 is blocked), and the Go runtime's
+        // os.Process needs it — without it the go tool dies with
+        // SIGSYS before printing anything. pidfd_getfd, the fd-
+        // stealing half of the pidfd pair, stays killed. Under the
+        // Strict profile the Landlock Signal scope restricts
+        // pidfd_send_signal to the sandbox's own domain on ABI 6+,
+        // same as kill(2).
         libc::SYS_process_madvise,
         libc::SYS_memfd_secret,
         libc::SYS_landlock_create_ruleset,
@@ -888,7 +897,9 @@ fn baseline_kill_syscalls() -> Vec<i64> {
         // io_uring_* in ENOSYS tier — libraries probe and fall back.
         libc::SYS_memfd_create,
         libc::SYS_pidfd_getfd,
-        libc::SYS_pidfd_send_signal,
+        // Not pidfd_send_signal — same reasoning as the strict list:
+        // kill(2) of a specific pid is permitted under baseline, so
+        // killing the pidfd form only broke the Go toolchain.
         libc::SYS_kcmp,
         libc::SYS_process_madvise,
         libc::SYS_memfd_secret,
@@ -1547,9 +1558,9 @@ mod tests {
     #[test]
     fn tier1_count_is_exact() {
         #[cfg(any(target_arch = "x86_64", target_env = "gnu"))]
-        let expected = 45;
+        let expected = 44;
         #[cfg(not(any(target_arch = "x86_64", target_env = "gnu")))]
-        let expected = 44; // kexec_file_load absent on aarch64-musl
+        let expected = 43; // kexec_file_load absent on aarch64-musl
         assert_eq!(
             tier1_kill_syscalls().len(),
             expected,
