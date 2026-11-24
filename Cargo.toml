@@ -51,7 +51,7 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 krun-sys = { version = "1.10", optional = true }
-reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false, optional = true }
+reqwest = { version = "0.13", features = ["blocking", "native-tls"], default-features = false, optional = true }
 openssl = { version = "0.10", optional = true }
 gpt = { version = "4.1", optional = true }
 nbd = { version = "0.3", optional = true }
