@@ -72,3 +72,49 @@ except PermissionError:
         String::from_utf8_lossy(&unscoped.stderr)
     );
 }
+
+/// prlimit64 is the signal scope's blind side: Landlock hooks
+/// kill/tgkill, not prlimit, and the kernel sends the signal itself.
+/// Under Strict (scope on) a cross-process prlimit64 must EPERM; the
+/// Baseline control (scope off) must still go through — the oracle
+/// that pins the block to this tier.
+#[test]
+fn signal_scope_blocks_cross_process_prlimit() {
+    if !arapuca::landlock::signal_scope_supported() {
+        eprintln!("skipping: Landlock ABI < 6 (no Scope::Signal)");
+        return;
+    }
+    if !python3_available() {
+        eprintln!("skipping: requires python3");
+        return;
+    }
+    let script = r#"
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.prlimit64.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+target = int(sys.argv[1])
+# RLIMIT_CPU = 0; read-only query (new = NULL) — the permission check
+# is what is being probed, no limit is changed.
+rc = libc.prlimit64(target, 0, None, None)
+if rc == 0:
+    print("PRLIMIT_OK")
+else:
+    e = ctypes.get_errno()
+    print("PRLIMIT_EPERM" if e == 1 else f"PRLIMIT_ERR_{e}")
+"#;
+    let scoped = run_target(&[], script, std::process::id());
+    let stdout = String::from_utf8_lossy(&scoped.stdout);
+    assert!(
+        scoped.status.success() && stdout.contains("PRLIMIT_EPERM"),
+        "scoped run must deny cross-process prlimit64: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&scoped.stderr)
+    );
+
+    let unscoped = run_target(&["--seccomp", "baseline"], script, std::process::id());
+    let stdout = String::from_utf8_lossy(&unscoped.stdout);
+    assert!(
+        unscoped.status.success() && stdout.contains("PRLIMIT_OK"),
+        "baseline control must allow prlimit64: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&unscoped.stderr)
+    );
+}

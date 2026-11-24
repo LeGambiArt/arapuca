@@ -352,6 +352,7 @@ pub fn apply(
     block_dumpable_zero: bool,
     deny_fs_metadata: bool,
     restrict_socket_domains: bool,
+    block_cross_process_rc: bool,
 ) -> crate::Result<()> {
     match profile {
         crate::SeccompProfile::Strict => {
@@ -360,6 +361,7 @@ pub fn apply(
                 block_dumpable_zero,
                 deny_fs_metadata,
                 restrict_socket_domains,
+                block_cross_process_rc,
             )?;
             seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
             log::info!("seccomp: strict filter applied");
@@ -370,6 +372,7 @@ pub fn apply(
                 block_dumpable_zero,
                 deny_fs_metadata,
                 restrict_socket_domains,
+                block_cross_process_rc,
             )?;
             seccompiler::apply_filter(&filter).map_err(|e| Error::Seccomp(format!("{e}")))?;
             log::info!("seccomp: baseline filter applied");
@@ -416,6 +419,7 @@ fn build_filter(
     block_dumpable_zero: bool,
     deny_fs_metadata: bool,
     restrict_socket_domains: bool,
+    block_cross_process_rc: bool,
 ) -> crate::Result<BpfProgram> {
     let arch = target_arch()?;
 
@@ -469,6 +473,9 @@ fn build_filter(
         // Strict already EPERMs AF_INET/AF_INET6 by their own rules;
         // the allowlist adds every other non-UNIX, non-NETLINK family.
         add_socket_domain_allowlist_rules(&mut eperm_rules, false)?;
+    }
+    if block_cross_process_rc {
+        add_cross_process_resource_rules(&mut eperm_rules)?;
     }
 
     // Socket domain filtering: block AF_INET and AF_INET6.
@@ -908,6 +915,7 @@ fn build_baseline_filter(
     block_dumpable_zero: bool,
     deny_fs_metadata: bool,
     restrict_socket_domains: bool,
+    block_cross_process_rc: bool,
 ) -> crate::Result<BpfProgram> {
     let arch = target_arch()?;
 
@@ -1041,6 +1049,9 @@ fn build_baseline_filter(
         // Baseline keeps AF_INET/AF_INET6 (loopback listeners), so its
         // allowlist adds them to the permitted set.
         add_socket_domain_allowlist_rules(&mut eperm_rules, true)?;
+    }
+    if block_cross_process_rc {
+        add_cross_process_resource_rules(&mut eperm_rules)?;
     }
 
     // prctl(PR_SET_PDEATHSIG, *) and prctl(PR_SET_DUMPABLE, non-zero)
@@ -1595,7 +1606,7 @@ mod tests {
         // Verify the filter compiles without error.
         // We don't apply it here because that would restrict this test process.
         let (exited, code) = run_in_clean_child(|| {
-            if build_filter(false, false, false, false).is_ok() {
+            if build_filter(false, false, false, false, false).is_ok() {
                 unsafe { libc::_exit(42) };
             }
         });
@@ -1612,7 +1623,14 @@ mod tests {
 
         if pid == 0 {
             // Child: apply filter and run the test.
-            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, false, false, false) {
+            if let Err(e) = apply(
+                &crate::SeccompProfile::Strict,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ) {
                 eprintln!("seccomp apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -2070,7 +2088,14 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
-            if let Err(e) = apply(&crate::SeccompProfile::Strict, false, true, false, false) {
+            if let Err(e) = apply(
+                &crate::SeccompProfile::Strict,
+                false,
+                true,
+                false,
+                false,
+                false,
+            ) {
                 eprintln!("seccomp apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -2113,7 +2138,14 @@ mod tests {
         assert!(pid >= 0, "fork failed");
 
         if pid == 0 {
-            if let Err(e) = apply(&crate::SeccompProfile::Baseline, false, false, false, false) {
+            if let Err(e) = apply(
+                &crate::SeccompProfile::Baseline,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ) {
                 eprintln!("seccomp baseline apply failed: {e}");
                 unsafe { libc::_exit(99) };
             }
@@ -2370,7 +2402,7 @@ mod tests {
         ] {
             for deny in [false, true] {
                 let (exited, code) = run_in_clean_child(|| {
-                    if apply(&profile, deny, false, false, false).is_err() {
+                    if apply(&profile, deny, false, false, false, false).is_err() {
                         unsafe { libc::_exit(99) };
                     }
                     for ty in [libc::SOCK_STREAM, libc::SOCK_DGRAM] {
@@ -2739,4 +2771,181 @@ fn add_socket_domain_allowlist_rules(
         rules.entry(syscall).or_default().push(rule.clone());
     }
     Ok(())
+}
+
+/// Cross-process resource-control syscalls blocked when signal
+/// scoping is active: Landlock's Signal scope hooks kill/tgkill/
+/// rt_sigqueueinfo but not these, and the kernel sends the signal
+/// itself — `prlimit64(victim, RLIMIT_CPU, {1, 2})` kills a same-uid
+/// process with SIGXCPU straight through the scope (reproduced
+/// through the real CLI by the 2026-11-23 review). Every rule keeps
+/// the self-targeted form (pid argument 0) legal: glibc's setrlimit
+/// and self-renice go through pid 0.
+///
+/// `setpriority` gets two rules: PRIO_USER with any `who` (who=0 is
+/// every process of the user), and any non-zero `who` (another
+/// process).
+///
+/// Not applied under a PID namespace: host pids are unnameable
+/// there, so the block would only stop a sandboxed supervisor from
+/// managing its own children.
+fn add_cross_process_resource_rules(
+    rules: &mut HashMap<i64, Vec<SeccompRule>>,
+) -> crate::Result<()> {
+    // prlimit64(pid, resource, new, old): pid != 0
+    let prlimit = SeccompRule::new(vec![
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0)
+            .map_err(|e| Error::Seccomp(format!("prlimit64 pid condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("prlimit64 rule: {e}")))?;
+    rules.entry(libc::SYS_prlimit64).or_default().push(prlimit);
+
+    // setpriority(which, who, prio)
+    let prio_user = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::PRIO_USER as u64,
+        )
+        .map_err(|e| Error::Seccomp(format!("setpriority PRIO_USER condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("setpriority PRIO_USER rule: {e}")))?;
+    let prio_other = SeccompRule::new(vec![
+        SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0)
+            .map_err(|e| Error::Seccomp(format!("setpriority who condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("setpriority who rule: {e}")))?;
+    let entry = rules.entry(libc::SYS_setpriority).or_default();
+    entry.push(prio_user);
+    entry.push(prio_other);
+
+    // sched_setscheduler/sched_setparam/sched_setaffinity: pid != 0
+    for syscall in [
+        libc::SYS_sched_setscheduler,
+        libc::SYS_sched_setparam,
+        libc::SYS_sched_setaffinity,
+    ] {
+        let rule = SeccompRule::new(vec![
+            SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0)
+                .map_err(|e| Error::Seccomp(format!("sched pid condition: {e}")))?,
+        ])
+        .map_err(|e| Error::Seccomp(format!("sched rule: {e}")))?;
+        rules.entry(syscall).or_default().push(rule);
+    }
+
+    // ioprio_set(which, who, ioprio): who != 0
+    let ioprio = SeccompRule::new(vec![
+        SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0)
+            .map_err(|e| Error::Seccomp(format!("ioprio_set who condition: {e}")))?,
+    ])
+    .map_err(|e| Error::Seccomp(format!("ioprio_set rule: {e}")))?;
+    rules.entry(libc::SYS_ioprio_set).or_default().push(ioprio);
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod cross_process_resource_tests {
+    use super::*;
+
+    /// The chattr-class rules must survive filter assembly: a later
+    /// HashMap::insert on the SYS_ioctl key silently replaced them
+    /// in both profiles (found by the 2026-11-23 viveiro review; the
+    /// entry().extend fix is what this test pins).
+    #[test]
+    fn fs_ioc_setflags_eperms_under_the_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("probe");
+        std::fs::write(&f, b"x").unwrap();
+        let cpath = f.to_str().unwrap();
+
+        for profile in [
+            crate::SeccompProfile::Strict,
+            crate::SeccompProfile::Baseline,
+        ] {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                if apply(&profile, false, false, true, false, false).is_err() {
+                    unsafe { libc::_exit(99) };
+                }
+                let cpath = std::ffi::CString::new(cpath).unwrap();
+                let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+                let mut flags: i32 = 0;
+                let rc = unsafe { libc::ioctl(fd, libc::FS_IOC_SETFLAGS, &mut flags) };
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                unsafe {
+                    libc::_exit(if rc == 0 {
+                        1
+                    } else if errno == libc::EPERM {
+                        42
+                    } else {
+                        2
+                    })
+                };
+            }
+            let mut status = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            assert!(libc::WIFEXITED(status), "child killed ({profile:?})");
+            let code = libc::WEXITSTATUS(status);
+            assert_eq!(
+                code, 42,
+                "FS_IOC_SETFLAGS must EPERM under the metadata tier in {profile:?} \
+                 (1 = ioctl reached the kernel, 2 = unexpected errno, 99 = apply failed)"
+            );
+        }
+    }
+
+    /// prlimit64 through the signal scope's blind side: a
+    /// cross-process call must EPERM, a self-targeted one must keep
+    /// working (glibc's setrlimit goes through prlimit64(0, ..)).
+    #[test]
+    fn cross_process_prlimit_eperms_under_scope() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let profile = crate::SeccompProfile::Strict;
+            if apply(&profile, false, false, false, false, true).is_err() {
+                unsafe { libc::_exit(99) };
+            }
+            // Self: must stay legal.
+            let mut old = libc::rlimit64 {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let self_rc =
+                unsafe { libc::prlimit64(0, libc::RLIMIT_CPU, std::ptr::null(), &mut old) };
+            // Parent (outside the filter): must EPERM.
+            let cross_rc = unsafe {
+                libc::prlimit64(
+                    libc::getppid(),
+                    libc::RLIMIT_CPU,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                )
+            };
+            let cross_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            unsafe {
+                libc::_exit(if self_rc != 0 {
+                    1
+                } else if cross_rc == 0 {
+                    2
+                } else if cross_errno == libc::EPERM {
+                    42
+                } else {
+                    3
+                })
+            };
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status), "child killed");
+        let code = libc::WEXITSTATUS(status);
+        assert_eq!(
+            code, 42,
+            "cross-process prlimit64 must EPERM under signal scoping \
+             (1 = self prlimit broke, 2 = cross-process call succeeded, 3 = other errno, 99 = apply failed)"
+        );
+    }
 }

@@ -414,12 +414,18 @@ fn run_wrapper_path(argc: libc::c_int, argv: *const *const libc::c_char) -> ! {
         let deny_fs_metadata = std::env::var("ARAPUCA_DENY_FS_METADATA").as_deref() == Ok("1");
         let restrict_socket_domains =
             std::env::var("ARAPUCA_RESTRICT_SOCKET_DOMAINS").as_deref() == Ok("1");
+        // Parsed again here: the landlock block's binding is scoped
+        // to that block.
+        let scope_signals = std::env::var("ARAPUCA_SCOPE_SIGNALS").as_deref() == Ok("1");
+        let block_cross_process_rc =
+            scope_signals && std::env::var("ARAPUCA_PID_NS").as_deref() != Ok("1");
         if let Err(e) = crate::seccomp::apply(
             &seccomp_profile,
             deny_unix_sockets,
             block_dumpable_zero,
             deny_fs_metadata,
             restrict_socket_domains,
+            block_cross_process_rc,
         ) {
             audit_layer(audit_fd, "Seccomp", false, Some(&e.to_string()));
             write_stderr(&format!("arapuca: selfexec: seccomp: {e}\n"));

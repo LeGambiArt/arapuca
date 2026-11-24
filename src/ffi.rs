@@ -1526,12 +1526,17 @@ pub unsafe extern "C" fn arapuca_apply(profile: *const ArapucaProfile) -> i32 {
     {
         let block_dumpable_zero = inner.unix_socket_connect_policy
             == crate::profile::UnixSocketConnectPolicy::DenyPrivileged;
+        // Same shape as the wrapper: block cross-process resource
+        // control when signal scoping is active; arapuca_apply has
+        // no pidns, so no exclusion applies here.
+        let scope_signals = inner.effective_scope_signals();
         if let Err(e) = crate::seccomp::apply(
             &inner.seccomp_profile,
             inner.deny_unix_sockets,
             block_dumpable_zero,
             inner.effective_deny_fs_metadata(),
             inner.effective_restrict_socket_domains(),
+            scope_signals,
         ) {
             set_error(&format!("seccomp: {e}"));
             return -1;
