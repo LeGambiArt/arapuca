@@ -34,7 +34,7 @@ microvm = ["dep:reqwest", "dep:krun-sys", "dep:openssl", "dep:gpt", "dep:nbd"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31", features = ["fs", "process", "sched", "signal", "user"] }
+nix = { version = "0.32", features = ["fs", "process", "sched", "signal", "user"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
