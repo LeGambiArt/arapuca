@@ -1024,7 +1024,9 @@ impl Sandbox for Linux {
             memory_max_mb: cfg.profile.max_memory_mb,
             pids_max: cfg.profile.max_pids,
             cpu_max_pct: cfg.profile.max_cpu_pct,
-            pids_overhead: (if effective_use_pidns { 1 } else { 0 })
+            // The pidns overhead is two: the PID-1 init (orphan
+            // reaper) and the relay-side target fork.
+            pids_overhead: (if effective_use_pidns { 2 } else { 0 })
                 + (if effective_use_netns { 1 } else { 0 }),
         };
 
