@@ -606,7 +606,8 @@ fn pidns_handover_through_supervisor() {
     // Netns launches imply a pid namespace: the wrapper's pidns child
     // installs the filter and the relay writes the pid-report. The
     // 8-byte pid+fd handover must reach the supervisor across that
-    // topology, and the target must be pid 1 in its namespace.
+    // topology, and the target must be pid 2 (after the PID-1 init)
+    // in its namespace.
     if !netns_supervisor_available() {
         eprintln!("skipping: requires userns/netns and yama scope < 3");
         return;
@@ -622,7 +623,7 @@ fn pidns_handover_through_supervisor() {
         ])
         .arg("/bin/sh")
         .arg("-c")
-        .arg("echo PIDNS_PID=$$; test $$ -eq 1")
+        .arg("echo PIDNS_PID=$$; test $$ -eq 2")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -632,8 +633,8 @@ fn pidns_handover_through_supervisor() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        stdout.contains("PIDNS_PID=1"),
-        "target must be pid 1 in its namespace: {stdout}"
+        stdout.contains("PIDNS_PID=2"),
+        "target must be pid 2 (after the PID-1 init) in its namespace: {stdout}"
     );
 }
 
