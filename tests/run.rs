@@ -795,9 +795,15 @@ fn seccomp_baseline_blocks_ptrace() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let exit_code = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("exit="))
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .expect("baseline ptrace test should report an exit code");
+    // 1 = EPERM (current tier); 137/159 = signal kill (older behavior).
     assert!(
-        stdout.contains("exit=159") || stdout.contains("exit=137"),
-        "baseline should block ptrace (strace): {stdout}"
+        matches!(exit_code, 1 | 137 | 159),
+        "baseline should block ptrace (strace), got exit {exit_code}: {stdout}"
     );
 }
 
