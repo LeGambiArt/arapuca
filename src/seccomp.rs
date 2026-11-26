@@ -329,8 +329,10 @@ pub(crate) fn validate_single_threaded() -> crate::Result<()> {
 ///
 /// The filter restrictiveness depends on the profile:
 /// - **Strict**: blocks AF_INET, symlink, memfd_create, io_uring, etc.
-/// - **Baseline**: blocks only escape-critical syscalls (ptrace, mount,
-///   namespace ops, kernel modules). Everything else allowed.
+/// - **Baseline**: blocks escape-critical syscalls (ptrace with EPERM,
+///   mount, namespace ops, kernel modules) and probe-friendly syscalls
+///   (`memfd_create`, `landlock_*`, `io_uring_*`) with ENOSYS. Everything
+///   else allowed.
 ///
 /// This calls `prctl(PR_SET_NO_NEW_PRIVS)` and then installs the filter.
 /// After this call, the process is restricted to allowed syscalls. The
@@ -864,7 +866,6 @@ pub(crate) fn summary(profile: &crate::SeccompProfile, deny_unix_sockets: bool) 
 /// Syscalls unconditionally blocked in the baseline profile.
 fn baseline_kill_syscalls() -> Vec<i64> {
     vec![
-        libc::SYS_ptrace,
         libc::SYS_mount,
         libc::SYS_umount2,
         libc::SYS_pivot_root,
@@ -889,13 +890,10 @@ fn baseline_kill_syscalls() -> Vec<i64> {
         libc::SYS_bpf,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
-        libc::SYS_landlock_create_ruleset,
-        libc::SYS_landlock_add_rule,
-        libc::SYS_landlock_restrict_self,
         libc::SYS_userfaultfd,
         SYS_LSM_SET_SELF_ATTR,
-        // io_uring_* in ENOSYS tier — libraries probe and fall back.
-        libc::SYS_memfd_create,
+        // memfd_create, landlock_* and io_uring_* are in the ENOSYS tier
+        // of the baseline profile; ptrace is in its EPERM tier.
         libc::SYS_pidfd_getfd,
         // Not pidfd_send_signal — same reasoning as the strict list:
         // kill(2) of a specific pid is permitted under baseline, so
@@ -1026,6 +1024,12 @@ fn build_baseline_filter(
     enosys_rules.insert(libc::SYS_io_uring_setup, vec![]);
     enosys_rules.insert(libc::SYS_io_uring_enter, vec![]);
     enosys_rules.insert(libc::SYS_io_uring_register, vec![]);
+    // Probe-friendly denials: libraries fall back on ENOSYS instead of
+    // being killed. The syscalls stay denied — no capability is granted.
+    enosys_rules.insert(libc::SYS_memfd_create, vec![]);
+    enosys_rules.insert(libc::SYS_landlock_create_ruleset, vec![]);
+    enosys_rules.insert(libc::SYS_landlock_add_rule, vec![]);
+    enosys_rules.insert(libc::SYS_landlock_restrict_self, vec![]);
     let enosys_filter = SeccompFilter::new(
         enosys_rules.into_iter().collect(),
         SeccompAction::Allow,
@@ -1050,6 +1054,9 @@ fn build_baseline_filter(
     // Consolidated EPERM filter for all argument-filtered rules.
     // A single stacked filter reduces BPF evaluation overhead.
     let mut eperm_rules: HashMap<i64, Vec<SeccompRule>> = HashMap::new();
+    // ptrace stays denied in the baseline profile; EPERM lets a caller
+    // handle the refusal instead of being killed. Never allowed.
+    eperm_rules.insert(libc::SYS_ptrace, vec![]);
     if deny_unix_sockets {
         add_unix_socket_rules(&mut eperm_rules)?;
     }
